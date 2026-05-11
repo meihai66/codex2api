@@ -145,8 +145,17 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			test_ip TEXT DEFAULT '',
 			test_location TEXT DEFAULT '',
-			test_latency_ms INTEGER DEFAULT 0
+			test_latency_ms INTEGER DEFAULT 0,
+			slots INTEGER NOT NULL DEFAULT 1,
+			expires_at TIMESTAMP NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS account_proxy_bindings (
+			account_id INTEGER PRIMARY KEY,
+			proxy_id INTEGER NOT NULL,
+			bound_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_proxy_bindings_proxy ON account_proxy_bindings(proxy_id);`,
 		`CREATE TABLE IF NOT EXISTS account_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			account_id INTEGER NOT NULL DEFAULT 0,
@@ -311,6 +320,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"proxies", "test_ip", "TEXT DEFAULT ''"},
 		{"proxies", "test_location", "TEXT DEFAULT ''"},
 		{"proxies", "test_latency_ms", "INTEGER DEFAULT 0"},
+		{"proxies", "slots", "INTEGER NOT NULL DEFAULT 1"},
+		{"proxies", "expires_at", "TIMESTAMP NULL"},
+		{"system_settings", "require_proxy_binding", "INTEGER DEFAULT 0"},
 	}
 	for _, column := range columns {
 		if err := db.ensureSQLiteColumn(ctx, column.table, column.name, column.def); err != nil {

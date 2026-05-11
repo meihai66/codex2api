@@ -39,6 +39,8 @@ export default function Proxies() {
   const [showAdd, setShowAdd] = useState(false)
   const [addInput, setAddInput] = useState('')
   const [addLabel, setAddLabel] = useState('')
+  const [addSlots, setAddSlots] = useState<number>(1)
+  const [addExpiresAt, setAddExpiresAt] = useState('')
   const [addLoading, setAddLoading] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [testingIds, setTestingIds] = useState<Set<number>>(new Set())
@@ -81,9 +83,12 @@ export default function Proxies() {
     if (urls.length === 0) return
     setAddLoading(true)
     try {
-      await api.addProxies({ urls, label: addLabel })
+      const expiresAt = addExpiresAt.trim() ? new Date(addExpiresAt).toISOString() : null
+      await api.addProxies({ urls, label: addLabel, slots: addSlots, expires_at: expiresAt })
       setAddInput('')
       setAddLabel('')
+      setAddSlots(1)
+      setAddExpiresAt('')
       setShowAdd(false)
       await reload()
     } catch { /* ignore */ }
@@ -252,14 +257,33 @@ export default function Proxies() {
               placeholder={"http://user:pass@ip:port\nsocks5://ip:port"}
               className="w-full h-32 px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-2 focus:ring-primary/30 font-mono"
             />
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 flex-wrap">
               <input
                 type="text"
                 value={addLabel}
                 onChange={e => setAddLabel(e.target.value)}
                 placeholder={t('proxies.labelPlaceholder')}
-                className="flex-1 px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                className="flex-1 min-w-[180px] px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-primary/30"
               />
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground whitespace-nowrap">容量 slots</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={addSlots}
+                  onChange={e => setAddSlots(Math.max(1, parseInt(e.target.value) || 1))}
+                  className="w-20 px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground whitespace-nowrap">到期 (留空=永久)</span>
+                <input
+                  type="datetime-local"
+                  value={addExpiresAt}
+                  onChange={e => setAddExpiresAt(e.target.value)}
+                  className="px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                />
+              </div>
               <button
                 onClick={handleAdd}
                 disabled={addLoading || !addInput.trim()}
@@ -320,6 +344,8 @@ export default function Proxies() {
                       </th>
                       <th className="p-3 font-semibold">{t('proxies.colUrl')}</th>
                       <th className="p-3 font-semibold">{t('proxies.colStatus')}</th>
+                      <th className="p-3 font-semibold">槽位</th>
+                      <th className="p-3 font-semibold">到期</th>
                       <th className="p-3 font-semibold">{t('proxies.colLocation')}</th>
                       <th className="p-3 font-semibold">{t('proxies.colIp')}</th>
                       <th className="p-3 font-semibold">{t('proxies.colLatency')}</th>
@@ -377,6 +403,22 @@ export default function Proxies() {
                               <span className={`size-1.5 rounded-full ${p.enabled ? 'bg-emerald-500' : 'bg-muted-foreground/50'}`} />
                               {p.enabled ? t('proxies.enabled') : t('proxies.disabled')}
                             </button>
+                          </td>
+                          {/* Slots used/total */}
+                          <td className="p-3">
+                            <span className={`text-xs font-mono ${p.used_slots >= p.slots ? 'text-red-500' : 'text-foreground'}`}>
+                              {p.used_slots}/{p.slots}
+                            </span>
+                          </td>
+                          {/* Expires at */}
+                          <td className="p-3">
+                            {p.expires_at ? (
+                              <span className="text-xs text-foreground whitespace-nowrap">
+                                {new Date(p.expires_at).toLocaleDateString()}
+                              </span>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">永久</span>
+                            )}
                           </td>
                           {/* Location */}
                           <td className="p-3">

@@ -384,6 +384,7 @@ export default function Settings() {
     admin_auth_source: 'disabled',
     auto_clean_full_usage: false,
     proxy_pool_enabled: false,
+    require_proxy_binding: false,
     fast_scheduler_enabled: false,
     max_retries: 2,
     max_rate_limit_retries: 1,
@@ -715,6 +716,16 @@ export default function Settings() {
                   <Select
                     value={settingsForm.fast_scheduler_enabled ? 'true' : 'false'}
                     onValueChange={(value) => setSettingsForm((f) => ({ ...f, fast_scheduler_enabled: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </SettingField>
+                <SettingField
+                  label="代理强制绑定"
+                  description="开启后账号必须绑定到代理才能跑请求；新增账号时按 slots/到期 自动挑代理（参考 kiro.rs 自动绑定）。关闭时未绑定账号可走全局代理或直连。"
+                >
+                  <Select
+                    value={settingsForm.require_proxy_binding ? 'true' : 'false'}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, require_proxy_binding: value === 'true' }))}
                     options={booleanOptions}
                   />
                 </SettingField>

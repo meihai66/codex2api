@@ -266,6 +266,7 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		return
 	}
 	h.db.InsertAccountEventAsync(id, "added", "oauth")
+	h.tryAutoBindProxy(ctx, id, proxyURL)
 
 	// Resin 租约继承
 	if proxy.IsResinEnabled() {
@@ -447,6 +448,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		return
 	}
 	h.db.InsertAccountEventAsync(id, "added", "oauth_callback")
+	h.tryAutoBindProxy(ctx, id, sess.ProxyURL)
 
 	// Resin 租约继承：将临时身份的 IP 租约迁移到正式 DBID
 	if proxy.IsResinEnabled() {

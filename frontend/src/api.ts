@@ -399,11 +399,11 @@ export const api = {
   // Proxies
   listProxies: () =>
     request<{ proxies: ProxyRow[] }>('/proxies'),
-  addProxies: (data: { urls?: string[]; url?: string; label?: string }) =>
+  addProxies: (data: { urls?: string[]; url?: string; label?: string; slots?: number; expires_at?: string | null }) =>
     request<{ message: string; inserted: number; total: number }>('/proxies', { method: 'POST', body: JSON.stringify(data) }),
   deleteProxy: (id: number) =>
     request<MessageResponse>(`/proxies/${id}`, { method: 'DELETE' }),
-  updateProxy: (id: number, data: { label?: string; enabled?: boolean }) =>
+  updateProxy: (id: number, data: { label?: string; enabled?: boolean; slots?: number; expires_at?: string | null }) =>
     request<MessageResponse>(`/proxies/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   batchDeleteProxies: (ids: number[]) =>
     request<{ message: string; deleted: number }>('/proxies/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
@@ -425,6 +425,9 @@ export interface ProxyRow {
   test_ip: string
   test_location: string
   test_latency_ms: number
+  slots: number
+  expires_at?: string | null
+  used_slots: number
 }
 
 export interface ProxyTestResult {

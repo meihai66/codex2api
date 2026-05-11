@@ -1427,6 +1427,10 @@ type Store struct {
 	proxyPoolEnabled bool     // 代理池是否开启
 	proxyRoundRobin  uint64   // 轮询计数器
 
+	// 自动绑定模式
+	requireProxyBinding atomic.Bool     // true 时账号必须绑定到代理才能跑请求
+	bindingManager      *BindingManager // 绑定关系管理器（DB-backed）
+
 	// Fast scheduler POC（默认关闭，通过环境变量启用）
 	fastScheduler        atomic.Pointer[FastScheduler]
 	fastSchedulerEnabled atomic.Bool
@@ -1505,7 +1509,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		stopCh:                  make(chan struct{}),
 		proxyPoolEnabled:        settings.ProxyPoolEnabled,
 		sessionBindings:         make(map[string]sessionAffinity),
+		bindingManager:          NewBindingManager(db),
 	}
+	s.requireProxyBinding.Store(settings.RequireProxyBinding)
 	s.testModel.Store(settings.TestModel)
 	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
 	s.SetUsageProbeMaxAge(time.Duration(settings.UsageProbeMaxAgeMinutes) * time.Minute)
@@ -1657,7 +1663,13 @@ func (s *Store) NextProxy() string {
 }
 
 // ResolveProxyForAccount returns the effective proxy for account-bound internal calls.
-// Priority: account proxy > sticky proxy pool > global proxy > direct.
+//
+// 优先级（自动绑定模式接入后）：
+//  1. account.ProxyURL —— 账号上手动指定的"专属代理"，最高优先级
+//  2. account_proxy_bindings 表中的绑定（自动绑定模式产出的结果）
+//  3. 旧版粘性代理池（按 account_id 取模）
+//  4. 全局 proxy_url
+//  5. 直连（如果 RequireProxyBinding=true 则上层应拒绝请求）
 func (s *Store) ResolveProxyForAccount(acc *Account) string {
 	if s == nil {
 		return ""
@@ -1674,7 +1686,79 @@ func (s *Store) ResolveProxyForAccount(acc *Account) string {
 		acc.mu.RUnlock()
 	}
 
+	// 2. 查自动绑定结果
+	if s.bindingManager != nil && accountID > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		proxyURL, err := s.bindingManager.ResolveProxyURL(ctx, accountID)
+		cancel()
+		if err == nil && proxyURL != "" {
+			return proxyURL
+		}
+	}
+
 	return s.resolveFallbackProxyForAccount(accountID)
+}
+
+// HasProxyBinding 查账号是否已绑定到代理（用于 require_proxy_binding 强制模式的判断）
+func (s *Store) HasProxyBinding(accountID int64) bool {
+	if s == nil || s.bindingManager == nil || accountID <= 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	url, err := s.bindingManager.ResolveProxyURL(ctx, accountID)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(url) != ""
+}
+
+// RequireProxyBinding 当前是否要求"账号必须绑代理才能跑"
+func (s *Store) RequireProxyBinding() bool {
+	if s == nil {
+		return false
+	}
+	return s.requireProxyBinding.Load()
+}
+
+// SetRequireProxyBinding 切换 require_proxy_binding 开关
+func (s *Store) SetRequireProxyBinding(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.requireProxyBinding.Store(enabled)
+}
+
+// BindingManager 暴露给外部（admin handler 等）使用
+func (s *Store) BindingManager() *BindingManager {
+	if s == nil {
+		return nil
+	}
+	return s.bindingManager
+}
+
+// AutoBindAccount 给账号自动绑定一个最优代理（账号添加流程调用）
+func (s *Store) AutoBindAccount(ctx context.Context, accountID int64) (int64, error) {
+	if s == nil || s.bindingManager == nil {
+		return 0, nil
+	}
+	return s.bindingManager.AutoBind(ctx, accountID)
+}
+
+// UnbindAccount 解绑账号（账号删除时调用）
+func (s *Store) UnbindAccount(ctx context.Context, accountID int64) error {
+	if s == nil || s.bindingManager == nil {
+		return nil
+	}
+	return s.bindingManager.Unbind(ctx, accountID)
+}
+
+// MarkProxyFailure 标记代理失败（请求失败时调用，5min 内不再被 auto-bind 挑中）
+func (s *Store) MarkProxyFailure(proxyID int64) {
+	if s == nil || s.bindingManager == nil {
+		return
+	}
+	s.bindingManager.MarkRecentFailure(proxyID)
 }
 
 func (s *Store) resolveFallbackProxyForAccount(accountID int64) string {
@@ -2020,11 +2104,14 @@ func (s *Store) StartBackgroundRefresh() {
 		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
 		// 添加定时重建 FastScheduler 以优化性能
 		rebuildSchedulerTicker := time.NewTicker(10 * time.Minute)
+		// 代理绑定轮换：剩余有效期 < 24h 时把绑定迁到更长的代理（参考 kiro.rs proxy_rotation.rs）
+		bindingRotationTicker := time.NewTicker(5 * time.Minute)
 		defer refreshTimer.Stop()
 		defer autoCleanupTicker.Stop()
 		defer fullUsageCleanupTicker.Stop()
 		defer expiredCleanupTicker.Stop()
 		defer rebuildSchedulerTicker.Stop()
+		defer bindingRotationTicker.Stop()
 
 		resetRefreshTimer := func() {
 			if !refreshTimer.Stop() {
@@ -2061,11 +2148,102 @@ func (s *Store) StartBackgroundRefresh() {
 				if s.FastSchedulerEnabled() {
 					s.rebuildFastScheduler()
 				}
+			case <-bindingRotationTicker.C:
+				// 后台代理绑定轮换：剩余有效期 < 24h 时换更长的代理
+				go s.rotateExpiringProxyBindings(context.Background())
 			case <-s.stopCh:
 				return
 			}
 		}
 	}()
+}
+
+// rotateExpiringProxyBindings 扫描所有绑定，把即将到期（剩余 < 24h）的代理上的绑定
+// 迁移到剩余有效期更长 + 仍有空槽的代理。无候选时静默跳过。
+func (s *Store) rotateExpiringProxyBindings(ctx context.Context) {
+	if s == nil || s.bindingManager == nil || s.db == nil {
+		return
+	}
+	const rotateThresholdHours = 24
+
+	rotateCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	bindings, err := s.db.ListProxyBindings(rotateCtx)
+	if err != nil {
+		log.Printf("[ProxyBinding] 读取绑定列表失败: %v", err)
+		return
+	}
+	if len(bindings) == 0 {
+		return
+	}
+	proxies, err := s.db.ListEnabledProxies(rotateCtx)
+	if err != nil {
+		log.Printf("[ProxyBinding] 读取代理列表失败: %v", err)
+		return
+	}
+	now := time.Now()
+	proxyByID := make(map[int64]*database.ProxyRow, len(proxies))
+	for _, p := range proxies {
+		proxyByID[p.ID] = p
+	}
+
+	rotated := 0
+	for _, b := range bindings {
+		cur := proxyByID[b.ProxyID]
+		// 当前代理已被禁用 / 删除 → 重新自动绑定
+		if cur == nil {
+			if newID, err := s.bindingManager.AutoBind(rotateCtx, b.AccountID); err == nil && newID > 0 {
+				log.Printf("[ProxyBinding] 重绑（原代理已失效）: account=%d → proxy=%d", b.AccountID, newID)
+				rotated++
+			}
+			continue
+		}
+		// 永不过期或还有 >24h → 跳过
+		if cur.ExpiresAt == nil {
+			continue
+		}
+		if cur.ExpiresAt.Sub(now) >= time.Duration(rotateThresholdHours)*time.Hour {
+			continue
+		}
+		// 找一个比当前更晚到期、且仍有空槽的候选
+		var best *database.ProxyRow
+		for _, p := range proxies {
+			if p.ID == cur.ID {
+				continue
+			}
+			if p.Slots-p.UsedSlots <= 0 {
+				continue
+			}
+			if p.ExpiresAt == nil || p.ExpiresAt.After(*cur.ExpiresAt) {
+				if best == nil {
+					best = p
+					continue
+				}
+				if best.ExpiresAt == nil {
+					continue // best 已经是永不过期
+				}
+				if p.ExpiresAt == nil || p.ExpiresAt.After(*best.ExpiresAt) {
+					best = p
+				}
+			}
+		}
+		if best == nil {
+			continue
+		}
+		if err := s.db.UpsertProxyBinding(rotateCtx, b.AccountID, best.ID); err != nil {
+			log.Printf("[ProxyBinding] 轮换失败 account=%d %d→%d: %v", b.AccountID, cur.ID, best.ID, err)
+			continue
+		}
+		log.Printf("[ProxyBinding] 已轮换: account=%d %d→%d (旧代理剩余 %.1fh)", b.AccountID, cur.ID, best.ID, cur.ExpiresAt.Sub(now).Hours())
+		rotated++
+		// 内存里把这个 proxy 的 used+1，best.used+1，避免下一轮重复挑同一个
+		cur.UsedSlots--
+		best.UsedSlots++
+	}
+	if rotated > 0 {
+		log.Printf("[ProxyBinding] 本轮共轮换 %d 个绑定", rotated)
+	}
 }
 
 // Stop 停止后台刷新

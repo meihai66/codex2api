@@ -283,6 +283,7 @@ export interface SystemSettings {
   auto_clean_error: boolean
   auto_clean_expired: boolean
   proxy_pool_enabled: boolean
+  require_proxy_binding: boolean
   fast_scheduler_enabled: boolean
   max_retries: number
   max_rate_limit_retries: number

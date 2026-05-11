@@ -46,7 +46,35 @@ func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
-	return h.store.NextForSessionWithFilter(sessionID, apiKeyID, exclude, filter)
+	return h.store.NextForSessionWithFilter(sessionID, apiKeyID, exclude, h.composeRequireBindingFilter(filter))
+}
+
+// waitForSessionAvailable 等待账号可用，包装一层 require_proxy_binding 过滤
+func (h *Handler) waitForSessionAvailable(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter) (*auth.Account, string) {
+	if h == nil || h.store == nil {
+		return nil, ""
+	}
+	return h.store.WaitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, h.composeRequireBindingFilter(filter))
+}
+
+// composeRequireBindingFilter 在 require_proxy_binding=true 时叠加一层"账号必须绑代理"的过滤。
+// 自动绑定模式下，未绑代理的账号会被调度器跳过，直至 503/no-account-available。
+func (h *Handler) composeRequireBindingFilter(base auth.AccountFilter) auth.AccountFilter {
+	if h == nil || h.store == nil || !h.store.RequireProxyBinding() {
+		return base
+	}
+	return func(acc *auth.Account) bool {
+		if base != nil && !base(acc) {
+			return false
+		}
+		if acc == nil {
+			return false
+		}
+		if strings.TrimSpace(acc.ProxyURL) != "" {
+			return true
+		}
+		return h.store.HasProxyBinding(acc.ID())
+	}
 }
 
 func (h *Handler) shouldUseWebsocketForHTTP() bool {
@@ -948,7 +976,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.waitForSessionAvailable(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -1588,7 +1616,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.waitForSessionAvailable(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -1808,7 +1836,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.waitForSessionAvailable(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)

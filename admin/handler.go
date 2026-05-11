@@ -917,6 +917,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual")
+		h.tryAutoBindProxy(ctx, id, req.ProxyURL)
 
 		// 热加载：直接加入内存池
 		newAcc := &auth.Account{
@@ -1034,6 +1035,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual_at")
+		h.tryAutoBindProxy(ctx, id, req.ProxyURL)
 
 		// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
 		atInfo := auth.ParseAccessToken(at)
@@ -1174,6 +1176,7 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		return
 	}
 	h.db.InsertAccountEventAsync(id, "added", "manual_openai_responses")
+	h.tryAutoBindProxy(ctx, id, req.ProxyURL)
 
 	h.store.AddAccount(&auth.Account{
 		DBID:         id,
@@ -1922,6 +1925,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				atomic.AddInt64(&successCount, 1)
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import_at")
+				bindCtx, bindCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				h.tryAutoBindProxy(bindCtx, id, proxyURL)
+				bindCancel()
 
 				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
 					sessionToken: tok.sessionToken,
@@ -1974,6 +1980,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				atomic.AddInt64(&successCount, 1)
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import")
+				bindCtx, bindCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				h.tryAutoBindProxy(bindCtx, id, proxyURL)
+				bindCancel()
 
 				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
 					refreshToken: tok.refreshToken,
@@ -2083,6 +2092,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 
 	// 从内存池移除
 	h.store.RemoveAccount(id)
+	_ = h.store.UnbindAccount(ctx, id)
 	h.db.InsertAccountEventAsync(id, "deleted", "manual")
 
 	writeMessage(c, http.StatusOK, "账号已删除")
@@ -2701,6 +2711,7 @@ type settingsResponse struct {
 	AutoCleanError                   bool   `json:"auto_clean_error"`
 	AutoCleanExpired                 bool   `json:"auto_clean_expired"`
 	ProxyPoolEnabled                 bool   `json:"proxy_pool_enabled"`
+	RequireProxyBinding              bool   `json:"require_proxy_binding"`
 	FastSchedulerEnabled             bool   `json:"fast_scheduler_enabled"`
 	MaxRetries                       int    `json:"max_retries"`
 	MaxRateLimitRetries              int    `json:"max_rate_limit_retries"`
@@ -2759,6 +2770,7 @@ type updateSettingsReq struct {
 	AutoCleanError                   *bool   `json:"auto_clean_error"`
 	AutoCleanExpired                 *bool   `json:"auto_clean_expired"`
 	ProxyPoolEnabled                 *bool   `json:"proxy_pool_enabled"`
+	RequireProxyBinding              *bool   `json:"require_proxy_binding"`
 	FastSchedulerEnabled             *bool   `json:"fast_scheduler_enabled"`
 	MaxRetries                       *int    `json:"max_retries"`
 	MaxRateLimitRetries              *int    `json:"max_rate_limit_retries"`
@@ -2899,6 +2911,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanError:                   h.store.GetAutoCleanError(),
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
+		RequireProxyBinding:              h.store.RequireProxyBinding(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
@@ -3122,6 +3135,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			_ = h.store.ReloadProxyPool()
 		}
 		log.Printf("设置已更新: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
+	}
+
+	if req.RequireProxyBinding != nil {
+		h.store.SetRequireProxyBinding(*req.RequireProxyBinding)
+		log.Printf("设置已更新: require_proxy_binding = %t", *req.RequireProxyBinding)
 	}
 
 	if req.FastSchedulerEnabled != nil {
@@ -3369,6 +3387,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanError:                   h.store.GetAutoCleanError(),
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
+		RequireProxyBinding:              h.store.RequireProxyBinding(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
@@ -3432,6 +3451,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanError:                   h.store.GetAutoCleanError(),
 		AutoCleanExpired:                 h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
+		RequireProxyBinding:              h.store.RequireProxyBinding(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
@@ -3880,9 +3900,11 @@ func (h *Handler) ListProxies(c *gin.Context) {
 // AddProxies 添加代理（支持批量）
 func (h *Handler) AddProxies(c *gin.Context) {
 	var req struct {
-		URLs  []string `json:"urls"`
-		URL   string   `json:"url"`
-		Label string   `json:"label"`
+		URLs      []string   `json:"urls"`
+		URL       string     `json:"url"`
+		Label     string     `json:"label"`
+		Slots     int        `json:"slots"`      // 容量（默认 1）
+		ExpiresAt *time.Time `json:"expires_at"` // RFC3339；不传则永不过期
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
@@ -3908,10 +3930,15 @@ func (h *Handler) AddProxies(c *gin.Context) {
 		}
 	}
 
+	slots := req.Slots
+	if slots < 1 {
+		slots = 1
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	inserted, err := h.db.InsertProxies(ctx, cleaned, req.Label)
+	inserted, err := h.db.InsertProxies(ctx, cleaned, req.Label, slots, req.ExpiresAt)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "添加代理失败")
 		return
@@ -3938,6 +3965,7 @@ func (h *Handler) DeleteProxy(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
+	_ = h.db.DeleteProxyBindingsByProxy(ctx, id)
 	if err := h.db.DeleteProxy(ctx, id); err != nil {
 		writeError(c, http.StatusInternalServerError, "删除代理失败")
 		return
@@ -3947,7 +3975,7 @@ func (h *Handler) DeleteProxy(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "代理已删除"})
 }
 
-// UpdateProxy 更新代理（启用/禁用/改标签）
+// UpdateProxy 更新代理（启用/禁用/改标签/槽位/到期）
 func (h *Handler) UpdateProxy(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -3956,8 +3984,10 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	}
 
 	var req struct {
-		Label   *string `json:"label"`
-		Enabled *bool   `json:"enabled"`
+		Label     *string    `json:"label"`
+		Enabled   *bool      `json:"enabled"`
+		Slots     *int       `json:"slots"`
+		ExpiresAt *time.Time `json:"expires_at"` // 传零值时间清空；不传保持原值
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
@@ -3967,7 +3997,7 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if err := h.db.UpdateProxy(ctx, id, req.Label, req.Enabled); err != nil {
+	if err := h.db.UpdateProxy(ctx, id, req.Label, req.Enabled, req.Slots, req.ExpiresAt); err != nil {
 		writeError(c, http.StatusInternalServerError, "更新代理失败")
 		return
 	}

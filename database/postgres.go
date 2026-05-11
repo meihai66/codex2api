@@ -576,6 +576,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS stream_flush_policy VARCHAR(20) DEFAULT 'immediate';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS stream_flush_interval_ms INT DEFAULT 20;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS image_storage_config TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS require_proxy_binding BOOLEAN DEFAULT FALSE;
 
 			CREATE TABLE IF NOT EXISTS prompt_filter_logs (
 				id               SERIAL PRIMARY KEY,
@@ -625,6 +626,16 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_ip VARCHAR(100) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_location VARCHAR(255) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_latency_ms INT DEFAULT 0;
+	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS slots INT NOT NULL DEFAULT 1;
+	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '100 years');
+
+	CREATE TABLE IF NOT EXISTS account_proxy_bindings (
+		account_id INT PRIMARY KEY,
+		proxy_id   INT NOT NULL,
+		bound_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		CONSTRAINT fk_account_proxy_binding FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
+	);
+	CREATE INDEX IF NOT EXISTS idx_account_proxy_bindings_proxy ON account_proxy_bindings(proxy_id);
 
 	CREATE TABLE IF NOT EXISTS account_events (
 		id         SERIAL PRIMARY KEY,
@@ -831,6 +842,7 @@ type SystemSettings struct {
 	StreamFlushPolicy                string
 	StreamFlushIntervalMS            int
 	ImageStorageConfig               string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
+	RequireProxyBinding              bool   // true 时账号未绑定代理则拒绝该账号上的请求；false 时未绑定可走全局代理或直连
 }
 
 // GetSystemSettings 加载全局设置
@@ -869,7 +881,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(usage_log_flush_interval_seconds, 5),
 		       COALESCE(stream_flush_policy, 'immediate'),
 		       COALESCE(stream_flush_interval_ms, 20),
-		       COALESCE(image_storage_config, '{}')
+		       COALESCE(image_storage_config, '{}'),
+		       COALESCE(require_proxy_binding, false)
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -885,6 +898,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ClientCompatMode, &s.CodexMinCLIVersion, &s.UsageLogMode, &s.UsageLogBatchSize,
 		&s.UsageLogFlushIntervalSeconds, &s.StreamFlushPolicy, &s.StreamFlushIntervalMS,
 		&s.ImageStorageConfig,
+		&s.RequireProxyBinding,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -907,9 +921,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_sensitive_words, prompt_filter_custom_patterns, prompt_filter_disabled_patterns,
 				client_compat_mode, codex_min_cli_version, usage_log_mode, usage_log_batch_size,
 				usage_log_flush_interval_seconds, stream_flush_policy, stream_flush_interval_ms,
-				image_storage_config
+				image_storage_config, require_proxy_binding
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44)
 			ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -953,7 +967,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				usage_log_flush_interval_seconds = EXCLUDED.usage_log_flush_interval_seconds,
 				stream_flush_policy = EXCLUDED.stream_flush_policy,
 				stream_flush_interval_ms = EXCLUDED.stream_flush_interval_ms,
-				image_storage_config = EXCLUDED.image_storage_config
+				image_storage_config = EXCLUDED.image_storage_config,
+				require_proxy_binding = EXCLUDED.require_proxy_binding
 		`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -964,7 +979,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.PromptFilterSensitiveWords, s.PromptFilterCustomPatterns, s.PromptFilterDisabledPatterns,
 		s.ClientCompatMode, s.CodexMinCLIVersion, s.UsageLogMode, s.UsageLogBatchSize,
 		s.UsageLogFlushIntervalSeconds, s.StreamFlushPolicy, s.StreamFlushIntervalMS,
-		s.ImageStorageConfig)
+		s.ImageStorageConfig, s.RequireProxyBinding)
 	return err
 }
 
@@ -997,19 +1012,27 @@ func (db *DB) GetAllAPIKeyValues(ctx context.Context) ([]string, error) {
 
 // ProxyRow 代理行
 type ProxyRow struct {
-	ID            int64     `json:"id"`
-	URL           string    `json:"url"`
-	Label         string    `json:"label"`
-	Enabled       bool      `json:"enabled"`
-	CreatedAt     time.Time `json:"created_at"`
-	TestIP        string    `json:"test_ip"`
-	TestLocation  string    `json:"test_location"`
-	TestLatencyMs int       `json:"test_latency_ms"`
+	ID            int64      `json:"id"`
+	URL           string     `json:"url"`
+	Label         string     `json:"label"`
+	Enabled       bool       `json:"enabled"`
+	CreatedAt     time.Time  `json:"created_at"`
+	TestIP        string     `json:"test_ip"`
+	TestLocation  string     `json:"test_location"`
+	TestLatencyMs int        `json:"test_latency_ms"`
+	Slots         int        `json:"slots"`                 // 容量：最多绑多少账号
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`  // 到期时间；nil 表示永不过期（迁移老数据用）
+	UsedSlots     int        `json:"used_slots"`            // 已绑账号数（计算字段，查询时填充）
 }
 
 // ListProxies 获取所有代理
 func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies ORDER BY id`)
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT p.id, p.url, p.label, p.enabled, p.created_at,
+			COALESCE(p.test_ip,''), COALESCE(p.test_location,''), COALESCE(p.test_latency_ms,0),
+			COALESCE(p.slots,1), p.expires_at,
+			(SELECT COUNT(*) FROM account_proxy_bindings b WHERE b.proxy_id = p.id)
+		FROM proxies p ORDER BY p.id`)
 	if err != nil {
 		return nil, err
 	}
@@ -1018,13 +1041,19 @@ func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
 	var proxies []*ProxyRow
 	for rows.Next() {
 		p := &ProxyRow{}
-		var createdAtRaw interface{}
-		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
+		var createdAtRaw, expiresAtRaw interface{}
+		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs, &p.Slots, &expiresAtRaw, &p.UsedSlots); err != nil {
 			return nil, err
 		}
 		p.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 		if err != nil {
 			return nil, err
+		}
+		if expiresAtRaw != nil {
+			if t, err := parseDBTimeValue(expiresAtRaw); err == nil && !t.IsZero() {
+				tt := t
+				p.ExpiresAt = &tt
+			}
 		}
 		proxies = append(proxies, p)
 	}
@@ -1033,9 +1062,17 @@ func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
 
 // ListEnabledProxies 获取已启用的代理
 func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
-	query := `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies WHERE enabled = true ORDER BY id`
+	query := `SELECT p.id, p.url, p.label, p.enabled, p.created_at,
+		COALESCE(p.test_ip,''), COALESCE(p.test_location,''), COALESCE(p.test_latency_ms,0),
+		COALESCE(p.slots,1), p.expires_at,
+		(SELECT COUNT(*) FROM account_proxy_bindings b WHERE b.proxy_id = p.id)
+		FROM proxies p WHERE p.enabled = true ORDER BY p.id`
 	if db.isSQLite() {
-		query = `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies WHERE enabled = 1 ORDER BY id`
+		query = `SELECT p.id, p.url, p.label, p.enabled, p.created_at,
+			COALESCE(p.test_ip,''), COALESCE(p.test_location,''), COALESCE(p.test_latency_ms,0),
+			COALESCE(p.slots,1), p.expires_at,
+			(SELECT COUNT(*) FROM account_proxy_bindings b WHERE b.proxy_id = p.id)
+			FROM proxies p WHERE p.enabled = 1 ORDER BY p.id`
 	}
 	rows, err := db.conn.QueryContext(ctx, query)
 	if err != nil {
@@ -1046,34 +1083,46 @@ func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
 	var proxies []*ProxyRow
 	for rows.Next() {
 		p := &ProxyRow{}
-		var createdAtRaw interface{}
-		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs); err != nil {
+		var createdAtRaw, expiresAtRaw interface{}
+		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs, &p.Slots, &expiresAtRaw, &p.UsedSlots); err != nil {
 			return nil, err
 		}
 		p.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 		if err != nil {
 			return nil, err
 		}
+		if expiresAtRaw != nil {
+			if t, err := parseDBTimeValue(expiresAtRaw); err == nil && !t.IsZero() {
+				tt := t
+				p.ExpiresAt = &tt
+			}
+		}
 		proxies = append(proxies, p)
 	}
 	return proxies, rows.Err()
 }
 
-// InsertProxy 插入单个代理
-func (db *DB) InsertProxy(ctx context.Context, url, label string) (int64, error) {
+// InsertProxy 插入单个代理（slots/expires_at 由调用方提供）
+func (db *DB) InsertProxy(ctx context.Context, url, label string, slots int, expiresAt *time.Time) (int64, error) {
+	if slots < 1 {
+		slots = 1
+	}
 	return db.insertRowID(ctx,
-		`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT (url) DO NOTHING RETURNING id`,
-		`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT(url) DO NOTHING`,
-		url, label,
+		`INSERT INTO proxies (url, label, slots, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT (url) DO NOTHING RETURNING id`,
+		`INSERT INTO proxies (url, label, slots, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT(url) DO NOTHING`,
+		url, label, slots, expiresAt,
 	)
 }
 
 // InsertProxies 批量插入代理（跳过已存在的）
-func (db *DB) InsertProxies(ctx context.Context, urls []string, label string) (int, error) {
+func (db *DB) InsertProxies(ctx context.Context, urls []string, label string, slots int, expiresAt *time.Time) (int, error) {
+	if slots < 1 {
+		slots = 1
+	}
 	inserted := 0
 	for _, u := range urls {
 		if db.isSQLite() {
-			res, err := db.conn.ExecContext(ctx, `INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT(url) DO NOTHING`, u, label)
+			res, err := db.conn.ExecContext(ctx, `INSERT INTO proxies (url, label, slots, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT(url) DO NOTHING`, u, label, slots, expiresAt)
 			if err != nil {
 				continue
 			}
@@ -1085,7 +1134,7 @@ func (db *DB) InsertProxies(ctx context.Context, urls []string, label string) (i
 		}
 		var id int64
 		err := db.conn.QueryRowContext(ctx,
-			`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT (url) DO NOTHING RETURNING id`, u, label).Scan(&id)
+			`INSERT INTO proxies (url, label, slots, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT (url) DO NOTHING RETURNING id`, u, label, slots, expiresAt).Scan(&id)
 		if err == nil {
 			inserted++
 		}
@@ -1120,8 +1169,10 @@ func (db *DB) DeleteProxies(ctx context.Context, ids []int64) (int, error) {
 	return int(affected), nil
 }
 
-// UpdateProxy 更新代理
-func (db *DB) UpdateProxy(ctx context.Context, id int64, label *string, enabled *bool) error {
+// UpdateProxy 更新代理。expiresAt 语义：
+//   - nil      → 不修改 expires_at（保持原值）
+//   - *t       → 设置 expires_at = t（如果想清空到期时间，传一个 IsZero 的 *time.Time 表示 NULL）
+func (db *DB) UpdateProxy(ctx context.Context, id int64, label *string, enabled *bool, slots *int, expiresAt *time.Time) error {
 	if label != nil {
 		if _, err := db.conn.ExecContext(ctx, `UPDATE proxies SET label = $1 WHERE id = $2`, *label, id); err != nil {
 			return err
@@ -1129,6 +1180,26 @@ func (db *DB) UpdateProxy(ctx context.Context, id int64, label *string, enabled 
 	}
 	if enabled != nil {
 		if _, err := db.conn.ExecContext(ctx, `UPDATE proxies SET enabled = $1 WHERE id = $2`, *enabled, id); err != nil {
+			return err
+		}
+	}
+	if slots != nil {
+		v := *slots
+		if v < 1 {
+			v = 1
+		}
+		if _, err := db.conn.ExecContext(ctx, `UPDATE proxies SET slots = $1 WHERE id = $2`, v, id); err != nil {
+			return err
+		}
+	}
+	if expiresAt != nil {
+		var arg interface{}
+		if expiresAt.IsZero() {
+			arg = nil
+		} else {
+			arg = *expiresAt
+		}
+		if _, err := db.conn.ExecContext(ctx, `UPDATE proxies SET expires_at = $1 WHERE id = $2`, arg, id); err != nil {
 			return err
 		}
 	}
@@ -1141,6 +1212,103 @@ func (db *DB) UpdateProxyTestResult(ctx context.Context, id int64, ip, location 
 		`UPDATE proxies SET test_ip = $1, test_location = $2, test_latency_ms = $3 WHERE id = $4`,
 		ip, location, latencyMs, id)
 	return err
+}
+
+// ==================== Account-Proxy Bindings (自动绑定模式) ====================
+
+// AccountProxyBinding 代理绑定关系
+type AccountProxyBinding struct {
+	AccountID int64     `json:"account_id"`
+	ProxyID   int64     `json:"proxy_id"`
+	BoundAt   time.Time `json:"bound_at"`
+}
+
+// FindProxyBindingForAccount 查找账号当前绑定的代理 id；未绑定返回 (0, nil)
+func (db *DB) FindProxyBindingForAccount(ctx context.Context, accountID int64) (int64, error) {
+	var proxyID int64
+	err := db.conn.QueryRowContext(ctx,
+		`SELECT proxy_id FROM account_proxy_bindings WHERE account_id = $1`, accountID).Scan(&proxyID)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return proxyID, err
+}
+
+// ListProxyBindings 列出全部绑定
+func (db *DB) ListProxyBindings(ctx context.Context) ([]*AccountProxyBinding, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT account_id, proxy_id, bound_at FROM account_proxy_bindings ORDER BY account_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*AccountProxyBinding
+	for rows.Next() {
+		b := &AccountProxyBinding{}
+		var boundRaw interface{}
+		if err := rows.Scan(&b.AccountID, &b.ProxyID, &boundRaw); err != nil {
+			return nil, err
+		}
+		b.BoundAt, err = parseDBTimeValue(boundRaw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// ListAccountsBoundToProxy 返回某个代理上已绑定的账号 id 列表
+func (db *DB) ListAccountsBoundToProxy(ctx context.Context, proxyID int64) ([]int64, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT account_id FROM account_proxy_bindings WHERE proxy_id = $1`, proxyID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// UpsertProxyBinding 写入或覆盖绑定（一个账号最多绑一条）
+func (db *DB) UpsertProxyBinding(ctx context.Context, accountID, proxyID int64) error {
+	pgStmt := `INSERT INTO account_proxy_bindings (account_id, proxy_id, bound_at) VALUES ($1, $2, NOW())
+			ON CONFLICT (account_id) DO UPDATE SET proxy_id = EXCLUDED.proxy_id, bound_at = EXCLUDED.bound_at`
+	sqliteStmt := `INSERT INTO account_proxy_bindings (account_id, proxy_id, bound_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+			ON CONFLICT(account_id) DO UPDATE SET proxy_id = excluded.proxy_id, bound_at = excluded.bound_at`
+	stmt := pgStmt
+	if db.isSQLite() {
+		stmt = sqliteStmt
+	}
+	_, err := db.conn.ExecContext(ctx, stmt, accountID, proxyID)
+	return err
+}
+
+// DeleteProxyBindingByAccount 解绑指定账号
+func (db *DB) DeleteProxyBindingByAccount(ctx context.Context, accountID int64) error {
+	_, err := db.conn.ExecContext(ctx, `DELETE FROM account_proxy_bindings WHERE account_id = $1`, accountID)
+	return err
+}
+
+// DeleteProxyBindingsByProxy 解绑一个代理上的所有账号（删除代理时调用）
+func (db *DB) DeleteProxyBindingsByProxy(ctx context.Context, proxyID int64) error {
+	_, err := db.conn.ExecContext(ctx, `DELETE FROM account_proxy_bindings WHERE proxy_id = $1`, proxyID)
+	return err
+}
+
+// CountProxyBindings 统计某代理上已绑账号数
+func (db *DB) CountProxyBindings(ctx context.Context, proxyID int64) (int, error) {
+	var n int
+	err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_proxy_bindings WHERE proxy_id = $1`, proxyID).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return n, err
 }
 
 // ==================== Usage Logs（批量写入） ====================

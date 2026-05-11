@@ -215,6 +215,7 @@
     "plan": "Plan",
     "status": "Status",
     "requests": "Requests(7d)",
+    "proxy": "Proxy",
     "usage": "Usage",
     "updatedAt": "Updated",
     "importTime": "Import Time",

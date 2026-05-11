@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
@@ -320,6 +321,7 @@ type accountResponse struct {
 	BaseConcurrencyEffective int64                      `json:"base_concurrency_effective"`
 	ConcurrencyCap           int64                      `json:"dynamic_concurrency_limit"`
 	ProxyURL                 string                     `json:"proxy_url"`
+	BoundProxyHostPort       string                     `json:"bound_proxy_ip_port,omitempty"`
 	CreatedAt                string                     `json:"created_at"`
 	UpdatedAt                string                     `json:"updated_at"`
 	ActiveRequests           int64                      `json:"active_requests"`
@@ -380,6 +382,27 @@ type schedulerBreakdownResponse struct {
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
 
+// extractProxyHostPort 从代理 URL 中提取 host:port，解析失败返回空串
+func extractProxyHostPort(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	host := u.Hostname()
+	port := u.Port()
+	if host == "" {
+		return ""
+	}
+	if port == "" {
+		return host
+	}
+	return host + ":" + port
+}
+
 // ListAccounts 获取账号列表
 func (h *Handler) ListAccounts(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -398,6 +421,20 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	accountMap := make(map[int64]*auth.Account)
 	for _, acc := range h.store.Accounts() {
 		accountMap[acc.DBID] = acc
+	}
+
+	// 批量加载代理绑定 + 代理 URL，用于在响应里附带 bound_proxy_ip_port
+	proxyURLByID := make(map[int64]string)
+	if proxies, err := h.db.ListProxies(ctx); err == nil {
+		for _, p := range proxies {
+			proxyURLByID[p.ID] = p.URL
+		}
+	}
+	bindingByAccount := make(map[int64]int64)
+	if bindings, err := h.db.ListProxyBindings(ctx); err == nil {
+		for _, b := range bindings {
+			bindingByAccount[b.AccountID] = b.ProxyID
+		}
 	}
 
 	// 获取每账号近 7 天请求统计（带 30 秒内存缓存）
@@ -540,6 +577,14 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				UserBilled:    usage.UserBilled,
 			}
 		}
+		// 计算实际生效的代理 host:port：手动覆盖 > 自动绑定
+		effectiveProxyURL := strings.TrimSpace(resp.ProxyURL)
+		if effectiveProxyURL == "" {
+			if pid, ok := bindingByAccount[row.ID]; ok && pid > 0 {
+				effectiveProxyURL = proxyURLByID[pid]
+			}
+		}
+		resp.BoundProxyHostPort = extractProxyHostPort(effectiveProxyURL)
 		accounts = append(accounts, resp)
 	}
 

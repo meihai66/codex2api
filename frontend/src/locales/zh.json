@@ -215,6 +215,7 @@
     "plan": "计划",
     "status": "状态",
     "requests": "请求(7d)",
+    "proxy": "代理",
     "usage": "用量",
     "updatedAt": "更新时间",
     "importTime": "导入时间",

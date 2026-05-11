@@ -60,6 +60,7 @@ export interface AccountRow {
   last_timeout_at?: ISODateString
   last_server_error_at?: ISODateString
   proxy_url: string
+  bound_proxy_ip_port?: string
   created_at: ISODateString
   updated_at: ISODateString
   active_requests?: number

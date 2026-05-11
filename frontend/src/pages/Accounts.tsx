@@ -1526,6 +1526,7 @@ export default function Accounts() {
                       <TableHead className="text-[13px] font-semibold">{t('accounts.email')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.plan')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.status')}</TableHead>
+                      <TableHead className="text-[13px] font-semibold">{t('accounts.proxy')}</TableHead>
                       <TableHead
                         className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
                         onClick={() => { if (sortKey === 'requests') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('requests'); setSortDir('desc') }; setPage(1) }}
@@ -1616,6 +1617,9 @@ export default function Accounts() {
                               </div>
                             </div>
                           </TableCell>
+                        <TableCell className="text-[12px] font-mono text-muted-foreground whitespace-nowrap">
+                          {account.bound_proxy_ip_port || '-'}
+                        </TableCell>
                         <TableCell>
                           <div className="space-y-0.5 text-[13px]">
                             <div className="flex items-center gap-2">

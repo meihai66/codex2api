@@ -20,6 +20,24 @@ function latencyBg(ms: number): string {
   return 'bg-red-500/10'
 }
 
+function normalizeProxyLine(line: string, protocol: 'http' | 'socks5'): string | null {
+  const trimmed = line.trim()
+  if (!trimmed) return null
+  if (trimmed.includes('://')) return trimmed
+  const parts = trimmed.split(':')
+  if (parts.length === 2) {
+    const [ip, port] = parts
+    if (!ip || !port) return null
+    return `${protocol}://${ip}:${port}`
+  }
+  if (parts.length === 4) {
+    const [ip, port, user, pass] = parts
+    if (!ip || !port || !user || !pass) return null
+    return `${protocol}://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${ip}:${port}`
+  }
+  return null
+}
+
 function maskUrl(url: string): string {
   try {
     const u = new URL(url)
@@ -38,6 +56,7 @@ export default function Proxies() {
   const [poolEnabled, setPoolEnabled] = useState(false)
   const [showAdd, setShowAdd] = useState(false)
   const [addInput, setAddInput] = useState('')
+  const [addProtocol, setAddProtocol] = useState<'http' | 'socks5'>('http')
   const [addLabel, setAddLabel] = useState('')
   const [addSlots, setAddSlots] = useState<number>(1)
   const [addExpiresAt, setAddExpiresAt] = useState('')
@@ -79,13 +98,17 @@ export default function Proxies() {
   }
 
   const handleAdd = async () => {
-    const urls = addInput.split('\n').map(s => s.trim()).filter(Boolean)
+    const urls = addInput
+      .split('\n')
+      .map(s => normalizeProxyLine(s, addProtocol))
+      .filter((s): s is string => !!s)
     if (urls.length === 0) return
     setAddLoading(true)
     try {
       const expiresAt = addExpiresAt.trim() ? new Date(addExpiresAt).toISOString() : null
       await api.addProxies({ urls, label: addLabel, slots: addSlots, expires_at: expiresAt })
       setAddInput('')
+      setAddProtocol('http')
       setAddLabel('')
       setAddSlots(1)
       setAddExpiresAt('')
@@ -251,10 +274,30 @@ export default function Proxies() {
             <p className="text-sm text-muted-foreground">
               {t('proxies.addProxyDesc')}
             </p>
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-xs text-muted-foreground whitespace-nowrap">{t('proxies.protocolLabel')}</span>
+              <div className="inline-flex rounded-md border border-border overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setAddProtocol('http')}
+                  className={`px-3 py-1.5 text-xs font-semibold transition-colors ${addProtocol === 'http' ? 'bg-primary text-primary-foreground' : 'bg-background text-foreground hover:bg-accent'}`}
+                >
+                  HTTP
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAddProtocol('socks5')}
+                  className={`px-3 py-1.5 text-xs font-semibold border-l border-border transition-colors ${addProtocol === 'socks5' ? 'bg-primary text-primary-foreground' : 'bg-background text-foreground hover:bg-accent'}`}
+                >
+                  SOCKS5
+                </button>
+              </div>
+              <span className="text-xs text-muted-foreground">{t('proxies.protocolHint')}</span>
+            </div>
             <textarea
               value={addInput}
               onChange={e => setAddInput(e.target.value)}
-              placeholder={"http://user:pass@ip:port\nsocks5://ip:port"}
+              placeholder={"ip:port:user:pass\nip:port\nhttp://user:pass@ip:port\nsocks5://ip:port"}
               className="w-full h-32 px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-2 focus:ring-primary/30 font-mono"
             />
             <div className="flex items-center gap-3 flex-wrap">

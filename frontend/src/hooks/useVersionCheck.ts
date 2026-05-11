@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-const GITHUB_API = 'https://api.github.com/repos/james-6-23/codex2api/releases/latest'
+const GITHUB_API = 'https://api.github.com/repos/meihai66/codex2api/releases/latest'
 const CACHE_KEY = 'codex2api_latest_version'
 const CACHE_TTL = 10 * 60 * 1000 // 10 分钟缓存
 const POLL_INTERVAL = 30 * 60 * 1000 // 30 分钟轮询

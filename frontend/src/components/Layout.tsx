@@ -48,7 +48,7 @@ export default function Layout({ children }: PropsWithChildren) {
   const [selfUpdateError, setSelfUpdateError] = useState('')
   const versionPopoverRef = useRef<HTMLDivElement | null>(null)
   const releaseURL = latestVersion
-    ? `https://github.com/james-6-23/codex2api/releases/tag/${encodeURIComponent(latestVersion)}`
+    ? `https://github.com/meihai66/codex2api/releases/tag/${encodeURIComponent(latestVersion)}`
     : undefined
 
   useEffect(() => {
@@ -262,7 +262,7 @@ export default function Layout({ children }: PropsWithChildren) {
                   <Languages className="size-[18px]" />
                 </button>
                 <a
-                  href="https://github.com/james-6-23/codex2api"
+                  href="https://github.com/meihai66/codex2api"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex items-center justify-center size-9 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors duration-150"

@@ -1,0 +1,80 @@
+name: codex2api-meihai
+
+# ============================================================
+#  Codex2API 一体化部署（meihai0211/codex 镜像）
+#  使用方法:
+#    1. cp .env.meihai.example .env
+#    2. 修改 .env 中的 ADMIN_SECRET、数据库密码等
+#    3. docker compose -f docker-compose.meihai.yml up -d
+# ============================================================
+
+services:
+  codex2api:
+    image: meihai0211/codex:latest
+    container_name: codex2api
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
+    env_file:
+      - .env
+    volumes:
+      - image-assets:/data
+      - ./logs:/app/logs
+      # 启用管理后台一键更新（Docker socket 权限较高，仅可信环境打开）
+      # - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - codex2api-net
+
+  postgres:
+    image: postgres:18-alpine
+    container_name: codex2api-postgres
+    environment:
+      POSTGRES_USER: ${DATABASE_USER:-codex2api}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-codex2api}
+      POSTGRES_DB: ${DATABASE_NAME:-codex2api}
+      PGDATA: /var/lib/postgresql/data
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-codex2api}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - codex2api-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: codex2api-redis
+    command: redis-server --appendonly yes
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - codex2api-net
+
+networks:
+  codex2api-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+    name: codex2api_pgdata
+  redisdata:
+    name: codex2api_redisdata
+  image-assets:
+    name: codex2api_image-assets

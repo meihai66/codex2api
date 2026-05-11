@@ -1,0 +1,28 @@
+name: codex2api-meihai-sqlite
+
+# ============================================================
+#  Codex2API 轻量部署（meihai0211/codex + SQLite + 内存缓存）
+#  使用方法:
+#    1. cp .env.meihai.sqlite.example .env
+#    2. 修改 .env 中的 ADMIN_SECRET
+#    3. docker compose -f docker-compose.meihai.sqlite.yml up -d
+# ============================================================
+
+services:
+  codex2api:
+    image: meihai0211/codex:latest
+    container_name: codex2api-sqlite
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
+    env_file:
+      - .env
+    volumes:
+      - sqlite-data:/data
+      - ./logs:/app/logs
+      # 启用管理后台一键更新（Docker socket 权限较高，仅可信环境打开）
+      # - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+volumes:
+  sqlite-data:
+    name: codex2api-meihai_sqlite-data

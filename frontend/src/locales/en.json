@@ -238,6 +238,7 @@
     "usage7d": "7d",
     "resetIn": "Reset: {{time}}",
     "cancelSelection": "Clear Selection",
+    "invertSelection": "Invert",
     "confirmDelete": "Are you sure you want to delete this account?",
     "confirmBatchDelete": "Are you sure you want to delete {{count}} selected accounts? This action cannot be undone.",
     "addTitle": "Add Account",

@@ -407,6 +407,8 @@ export const api = {
     request<MessageResponse>(`/proxies/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   batchDeleteProxies: (ids: number[]) =>
     request<{ message: string; deleted: number }>('/proxies/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
+  batchUpdateProxies: (data: { ids: number[]; slots?: number; enabled?: boolean; expires_at?: string | null }) =>
+    request<{ message: string; updated: number }>('/proxies/batch-update', { method: 'POST', body: JSON.stringify(data) }),
   testProxy: (url: string, id?: number, lang?: string) =>
     request<ProxyTestResult>('/proxies/test', { method: 'POST', body: JSON.stringify({ url, id, lang }) }),
   // OAuth

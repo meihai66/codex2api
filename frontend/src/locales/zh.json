@@ -238,6 +238,7 @@
     "usage7d": "7d",
     "resetIn": "重置: {{time}}",
     "cancelSelection": "取消选择",
+    "invertSelection": "反选",
     "confirmDelete": "确定删除此账号？",
     "confirmBatchDelete": "确定要删除选中的 {{count}} 个账号吗？此操作不可撤销。",
     "addTitle": "添加账号",

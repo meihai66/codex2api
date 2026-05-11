@@ -26,7 +26,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy, Power, PowerOff, Hourglass, X } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy, Power, PowerOff, Hourglass, X, Replace } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
@@ -92,7 +92,7 @@ async function runAccountBatch(ids: number[], action: (id: number) => Promise<un
 
 export default function Accounts() {
   const { t } = useTranslation()
-  const pageSizeOptions = [10, 20, 50, 100]
+  const pageSizeOptions = [10, 20, 50, 100, 500, 1000]
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
@@ -384,6 +384,16 @@ export default function Accounts() {
       })
     }
   }, [allPageSelected, pagedAccountIds])
+
+  const invertSelection = useCallback(() => {
+    setSelected((prev) => {
+      const next = new Set<number>()
+      for (const account of sortedAccounts) {
+        if (!prev.has(account.id)) next.add(account.id)
+      }
+      return next
+    })
+  }, [sortedAccounts])
 
   const handleAdd = async () => {
     if (!addForm.refresh_token.trim()) return
@@ -1492,6 +1502,9 @@ export default function Accounts() {
               </Button>
               <Button variant="destructive" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchDelete()}>
                 {t('accounts.batchDelete')}
+              </Button>
+              <Button variant="outline" size="sm" onClick={invertSelection} title={t('accounts.invertSelection')}>
+                <Replace className="size-3 mr-1" />{t('accounts.invertSelection')}
               </Button>
               <Button variant="outline" size="sm" onClick={() => setSelected(new Set())}>
                 {t('accounts.cancelSelection')}

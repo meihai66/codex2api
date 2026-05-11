@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Globe, Plus, Trash2, Play, MapPin, Loader2, Zap, ChevronLeft, ChevronRight, Eye, EyeOff } from 'lucide-react'
+import { Globe, Plus, Trash2, Play, MapPin, Loader2, Zap, Eye, EyeOff, Settings2 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
+import Pagination from '@/components/Pagination'
 import { api, type ProxyRow, type ProxyTestResult } from '../api'
 
-const PAGE_SIZE = 10
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 500, 1000]
 
 function latencyColor(ms: number): string {
   if (ms <= 0) return 'text-muted-foreground'
@@ -65,7 +66,11 @@ export default function Proxies() {
   const [testingIds, setTestingIds] = useState<Set<number>>(new Set())
   const [testAllLoading, setTestAllLoading] = useState(false)
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
   const [revealedIds, setRevealedIds] = useState<Set<number>>(new Set())
+  const [showBatchSlots, setShowBatchSlots] = useState(false)
+  const [batchSlots, setBatchSlots] = useState<number>(1)
+  const [batchSlotsLoading, setBatchSlotsLoading] = useState(false)
 
   const ipApiLang = i18n.language?.startsWith('zh') ? 'zh-CN' : 'en'
 
@@ -80,8 +85,8 @@ export default function Proxies() {
 
   useEffect(() => { reload() }, [reload])
 
-  const totalPages = Math.max(1, Math.ceil(proxies.length / PAGE_SIZE))
-  const pagedProxies = proxies.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const totalPages = Math.max(1, Math.ceil(proxies.length / pageSize))
+  const pagedProxies = proxies.slice((page - 1) * pageSize, page * pageSize)
 
   useEffect(() => {
     if (page > totalPages) setPage(totalPages)
@@ -132,6 +137,18 @@ export default function Proxies() {
       setSelected(new Set())
       await reload()
     } catch { /* ignore */ }
+  }
+
+  const handleBatchUpdateSlots = async () => {
+    if (selected.size === 0) return
+    const slots = Math.max(1, Math.floor(batchSlots))
+    setBatchSlotsLoading(true)
+    try {
+      await api.batchUpdateProxies({ ids: [...selected], slots })
+      setShowBatchSlots(false)
+      await reload()
+    } catch { /* ignore */ }
+    setBatchSlotsLoading(false)
   }
 
   const handleToggle = async (p: ProxyRow) => {
@@ -236,13 +253,25 @@ export default function Proxies() {
           </div>
 
           {selected.size > 0 && (
-            <button
-              onClick={handleBatchDelete}
-              className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm font-semibold text-destructive transition-colors hover:bg-destructive/20"
-            >
-              <Trash2 className="size-4" />
-              {t('proxies.deleteSelected', { count: selected.size })}
-            </button>
+            <>
+              <button
+                onClick={() => {
+                  setBatchSlots(1)
+                  setShowBatchSlots(true)
+                }}
+                className="flex items-center gap-2 rounded-md border border-border bg-background px-3 py-2 text-sm font-semibold text-foreground transition-colors hover:bg-muted/50"
+              >
+                <Settings2 className="size-4" />
+                批量改容量 ({selected.size})
+              </button>
+              <button
+                onClick={handleBatchDelete}
+                className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm font-semibold text-destructive transition-colors hover:bg-destructive/20"
+              >
+                <Trash2 className="size-4" />
+                {t('proxies.deleteSelected', { count: selected.size })}
+              </button>
+            </>
           )}
 
           {proxies.length > 0 && (
@@ -522,46 +551,69 @@ export default function Proxies() {
               </div>
 
               {/* Pagination */}
-              {totalPages > 1 && (
-                <div className="flex items-center justify-between px-4 py-3 border-t border-border">
-                  <span className="text-xs text-muted-foreground">
-                    {t('proxies.pagination', { total: proxies.length, page, totalPages })}
-                  </span>
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => setPage(p => Math.max(1, p - 1))}
-                      disabled={page <= 1}
-                      className="flex items-center justify-center size-8 rounded-lg border border-border text-foreground hover:bg-muted/50 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-                    >
-                      <ChevronLeft className="size-4" />
-                    </button>
-                    {Array.from({ length: totalPages }, (_, i) => i + 1).map(n => (
-                      <button
-                        key={n}
-                        onClick={() => setPage(n)}
-                        className={`flex items-center justify-center size-8 rounded-lg text-xs font-medium transition-all ${
-                          n === page
-                            ? 'bg-primary text-primary-foreground shadow-sm'
-                            : 'border border-border text-foreground hover:bg-muted/50'
-                        }`}
-                      >
-                        {n}
-                      </button>
-                    ))}
-                    <button
-                      onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                      disabled={page >= totalPages}
-                      className="flex items-center justify-center size-8 rounded-lg border border-border text-foreground hover:bg-muted/50 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-                    >
-                      <ChevronRight className="size-4" />
-                    </button>
-                  </div>
-                </div>
-              )}
+              <div className="px-4 pb-3">
+                <Pagination
+                  page={page}
+                  totalPages={totalPages}
+                  onPageChange={setPage}
+                  totalItems={proxies.length}
+                  pageSize={pageSize}
+                  pageSizeOptions={PAGE_SIZE_OPTIONS}
+                  onPageSizeChange={(next) => {
+                    setPageSize(next)
+                    setPage(1)
+                  }}
+                />
+              </div>
             </>
           )}
         </CardContent>
       </Card>
+
+      {/* 批量改容量 弹窗 */}
+      {showBatchSlots && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4"
+          onClick={() => !batchSlotsLoading && setShowBatchSlots(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-lg border border-border bg-background p-5 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h4 className="text-base font-semibold text-foreground">批量修改可绑定槽位</h4>
+            <p className="mt-1 text-xs text-muted-foreground">
+              将选中的 <span className="font-semibold text-foreground">{selected.size}</span> 个代理的槽位上限统一修改为：
+            </p>
+            <div className="mt-4 flex items-center gap-2">
+              <span className="text-xs text-muted-foreground whitespace-nowrap">slots</span>
+              <input
+                type="number"
+                min={1}
+                value={batchSlots}
+                onChange={(e) => setBatchSlots(Math.max(1, parseInt(e.target.value) || 1))}
+                className="w-full px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+              />
+            </div>
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setShowBatchSlots(false)}
+                disabled={batchSlotsLoading}
+                className="px-3 py-1.5 rounded-md border border-border text-sm text-foreground hover:bg-muted/50 transition-colors disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleBatchUpdateSlots}
+                disabled={batchSlotsLoading}
+                className="flex items-center gap-1.5 px-4 py-1.5 rounded-md text-sm font-semibold bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+              >
+                {batchSlotsLoading && <Loader2 className="size-3.5 animate-spin" />}
+                {batchSlotsLoading ? '更新中...' : '确认更新'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

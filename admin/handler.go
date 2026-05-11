@@ -180,6 +180,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/proxies/:id", h.DeleteProxy)
 	api.PATCH("/proxies/:id", h.UpdateProxy)
 	api.POST("/proxies/batch-delete", h.BatchDeleteProxies)
+	api.POST("/proxies/batch-update", h.BatchUpdateProxies)
 	api.POST("/proxies/test", h.TestProxy)
 
 	// OAuth 授权流程
@@ -4049,6 +4050,38 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 
 	_ = h.store.ReloadProxyPool()
 	c.JSON(http.StatusOK, gin.H{"message": "代理已更新"})
+}
+
+// BatchUpdateProxies 批量更新代理（目前支持 slots、enabled、expires_at）
+func (h *Handler) BatchUpdateProxies(c *gin.Context) {
+	var req struct {
+		IDs       []int64    `json:"ids"`
+		Slots     *int       `json:"slots"`
+		Enabled   *bool      `json:"enabled"`
+		ExpiresAt *time.Time `json:"expires_at"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要更新的代理 ID 列表")
+		return
+	}
+	if req.Slots == nil && req.Enabled == nil && req.ExpiresAt == nil {
+		writeError(c, http.StatusBadRequest, "请提供要更新的字段")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	updated := 0
+	for _, id := range req.IDs {
+		if err := h.db.UpdateProxy(ctx, id, nil, req.Enabled, req.Slots, req.ExpiresAt); err != nil {
+			continue
+		}
+		updated++
+	}
+
+	_ = h.store.ReloadProxyPool()
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已更新 %d 个代理", updated), "updated": updated})
 }
 
 // BatchDeleteProxies 批量删除代理

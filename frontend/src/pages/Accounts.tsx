@@ -1617,7 +1617,7 @@ export default function Accounts() {
                               </div>
                             </div>
                           </TableCell>
-                        <TableCell className="text-[12px] font-mono text-muted-foreground whitespace-nowrap">
+                        <TableCell className="text-[14px] text-muted-foreground whitespace-nowrap">
                           {account.bound_proxy_ip_port || '-'}
                         </TableCell>
                         <TableCell>

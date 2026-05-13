@@ -1,7 +1,8 @@
-import type { ChangeEvent, KeyboardEvent, ReactNode } from 'react'
+import type { ChangeEvent, FormEvent, ReactNode } from 'react'
 import { useCallback, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
+import Modal from '../components/Modal'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import ToastNotice from '../components/ToastNotice'
@@ -10,11 +11,12 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import type { APIKeyRow } from '../types'
 import { getErrorMessage } from '../utils/error'
-import { formatRelativeTime } from '../utils/time'
+import { formatBeijingTime, formatRelativeTime } from '../utils/time'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import {
   Table,
   TableBody,
@@ -25,6 +27,8 @@ import {
 } from '@/components/ui/table'
 import {
   Copy,
+  CalendarClock,
+  CircleDollarSign,
   Eye,
   EyeOff,
   Fingerprint,
@@ -35,10 +39,28 @@ import {
   Trash2,
 } from 'lucide-react'
 
+type ExpireMode = 'never' | '7' | '30' | '90' | 'custom'
+
+interface CreateKeyFormState {
+  name: string
+  key: string
+  quotaLimit: string
+  expireMode: ExpireMode
+  expiresAt: string
+}
+
+const initialCreateForm: CreateKeyFormState = {
+  name: '',
+  key: '',
+  quotaLimit: '',
+  expireMode: 'never',
+  expiresAt: '',
+}
+
 export default function APIKeys() {
   const { t } = useTranslation()
-  const [newKeyName, setNewKeyName] = useState('')
-  const [newKeyValue, setNewKeyValue] = useState('')
+  const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [createForm, setCreateForm] = useState<CreateKeyFormState>(initialCreateForm)
   const [createdKeyId, setCreatedKeyId] = useState<number | null>(null)
   const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set())
   const [creating, setCreating] = useState(false)
@@ -62,14 +84,52 @@ export default function APIKeys() {
       .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())[0]
   }, [keys])
 
-  const handleCreateKey = async () => {
+  const expireOptions = useMemo(
+    () => [
+      { label: t('apiKeys.expireNever'), value: 'never' },
+      { label: t('apiKeys.expire7Days'), value: '7' },
+      { label: t('apiKeys.expire30Days'), value: '30' },
+      { label: t('apiKeys.expire90Days'), value: '90' },
+      { label: t('apiKeys.expireCustom'), value: 'custom' },
+    ],
+    [t]
+  )
+
+  const updateCreateForm = (patch: Partial<CreateKeyFormState>) => {
+    setCreateForm((current) => ({ ...current, ...patch }))
+  }
+
+  const closeCreateDialog = () => {
+    if (creating) return
+    setCreateDialogOpen(false)
+  }
+
+  const handleCreateKey = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault()
     setCreating(true)
     try {
-      const result = await api.createAPIKey(newKeyName.trim() || t('apiKeys.defaultName'), newKeyValue.trim() || undefined)
+      const quotaLimitText = createForm.quotaLimit.trim()
+      let quotaLimit: number | undefined
+      if (quotaLimitText) {
+        quotaLimit = Number(quotaLimitText)
+        if (!Number.isFinite(quotaLimit) || quotaLimit < 0) {
+          showToast(t('apiKeys.quotaInvalid'), 'error')
+          return
+        }
+      }
+
+      const payload = {
+        name: createForm.name.trim() || t('apiKeys.defaultName'),
+        ...(createForm.key.trim() ? { key: createForm.key.trim() } : {}),
+        ...(quotaLimit && quotaLimit > 0 ? { quota_limit: quotaLimit } : {}),
+        ...buildExpirationPayload(createForm, t),
+      }
+
+      const result = await api.createAPIKey(payload)
       setCreatedKeyId(result.id)
       setVisibleKeys((prev) => new Set(prev).add(result.id))
-      setNewKeyName('')
-      setNewKeyValue('')
+      setCreateForm(initialCreateForm)
+      setCreateDialogOpen(false)
       showToast(t('apiKeys.keyCreateSuccess'))
       void reload()
     } catch (error) {
@@ -162,6 +222,12 @@ export default function APIKeys() {
           title={t('apiKeys.title')}
           description={t('apiKeys.description')}
           onRefresh={() => void reload()}
+          actions={
+            <Button onClick={() => setCreateDialogOpen(true)} className="max-sm:w-full">
+              <Plus className="size-3.5" />
+              {t('apiKeys.createKey')}
+            </Button>
+          }
         />
 
         <div className="mb-4 grid gap-3 md:grid-cols-3">
@@ -188,61 +254,7 @@ export default function APIKeys() {
           />
         </div>
 
-        <div className="grid gap-4 xl:grid-cols-[minmax(320px,420px)_minmax(0,1fr)]">
-          <div className="space-y-4">
-            <Card className="py-0">
-              <CardContent className="p-4">
-                <div className="mb-4 flex items-start gap-3">
-                  <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                    <Plus className="size-5" />
-                  </div>
-                  <div>
-                    <h3 className="text-base font-semibold text-foreground">{t('apiKeys.createTitle')}</h3>
-                    <p className="mt-1 text-sm leading-relaxed text-muted-foreground">{t('apiKeys.createDesc')}</p>
-                  </div>
-                </div>
-
-                <div className="space-y-3">
-                  <div>
-                    <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">{t('apiKeys.nameLabel')}</label>
-                    <Input
-                      placeholder={t('apiKeys.keyNamePlaceholder')}
-                      value={newKeyName}
-                      onChange={(event: ChangeEvent<HTMLInputElement>) => setNewKeyName(event.target.value)}
-                    />
-                  </div>
-                  <div>
-                    <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">{t('apiKeys.keyLabel')}</label>
-                    <Input
-                      placeholder={t('apiKeys.keyValuePlaceholder')}
-                      value={newKeyValue}
-                      onChange={(event: ChangeEvent<HTMLInputElement>) => setNewKeyValue(event.target.value)}
-                      onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
-                        if (event.key === 'Enter' && !creating) {
-                          void handleCreateKey()
-                        }
-                      }}
-                    />
-                  </div>
-                  <Button onClick={() => void handleCreateKey()} disabled={creating} className="w-full">
-                    <Plus className="size-3.5" />
-                    {creating ? t('apiKeys.creating') : t('apiKeys.createKey')}
-                  </Button>
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card className="py-0">
-              <CardContent className="p-4">
-                <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
-                  <LockKeyhole className="size-4 text-primary" />
-                  {t('apiKeys.securityTitle')}
-                </div>
-                <p className="text-sm leading-relaxed text-muted-foreground">{t('apiKeys.keyAuthNote')}</p>
-              </CardContent>
-            </Card>
-          </div>
-
+        <div className="space-y-4">
           <Card>
             <CardContent className="p-4">
               <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -267,6 +279,8 @@ export default function APIKeys() {
                       <TableRow>
                         <TableHead>{t('common.name')}</TableHead>
                         <TableHead>{t('apiKeys.keyColumn')}</TableHead>
+                        <TableHead>{t('apiKeys.quotaColumn')}</TableHead>
+                        <TableHead>{t('apiKeys.expiresColumn')}</TableHead>
                         <TableHead>{t('common.createdAt')}</TableHead>
                         <TableHead className="text-right">{t('common.actions')}</TableHead>
                       </TableRow>
@@ -277,6 +291,7 @@ export default function APIKeys() {
                         const isNew = createdKeyId === keyRow.id
                         const displayKey = isVisible ? keyRow.raw_key : keyRow.key
                         const copyValue = keyRow.raw_key || keyRow.key
+                        const status = getAPIKeyStatus(keyRow)
                         return (
                           <TableRow key={keyRow.id} className={isNew ? 'bg-[hsl(var(--success-bg))]' : ''}>
                             <TableCell className="font-medium text-foreground">
@@ -285,6 +300,11 @@ export default function APIKeys() {
                                 {isNew ? (
                                   <Badge variant="outline" className="border-transparent bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]">
                                     {t('apiKeys.newBadge')}
+                                  </Badge>
+                                ) : null}
+                                {status !== 'active' ? (
+                                  <Badge variant={status === 'expired' ? 'secondary' : 'destructive'}>
+                                    {t(`apiKeys.status.${status}`)}
                                   </Badge>
                                 ) : null}
                               </div>
@@ -312,6 +332,22 @@ export default function APIKeys() {
                                 </Button>
                               </div>
                             </TableCell>
+                            <TableCell className="min-w-[150px] text-sm text-muted-foreground">
+                              <div className="space-y-1">
+                                <div className="font-medium text-foreground">{formatQuotaLimit(keyRow, t)}</div>
+                                {keyRow.quota_limit > 0 ? (
+                                  <div className="h-1.5 w-28 overflow-hidden rounded-full bg-muted">
+                                    <div
+                                      className="h-full rounded-full bg-primary"
+                                      style={{ width: `${Math.min(100, Math.max(0, (keyRow.quota_used / keyRow.quota_limit) * 100))}%` }}
+                                    />
+                                  </div>
+                                ) : null}
+                              </div>
+                            </TableCell>
+                            <TableCell className="text-muted-foreground">
+                              {formatExpiration(keyRow, t)}
+                            </TableCell>
                             <TableCell className="text-muted-foreground">
                               {formatRelativeTime(keyRow.created_at, { variant: 'compact' })}
                             </TableCell>
@@ -337,12 +373,183 @@ export default function APIKeys() {
               </StateShell>
             </CardContent>
           </Card>
+
+          <Card className="py-0">
+            <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex min-w-0 items-start gap-3">
+                <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                  <LockKeyhole className="size-4" />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-foreground">{t('apiKeys.securityTitle')}</div>
+                  <p className="mt-1 text-sm leading-relaxed text-muted-foreground">{t('apiKeys.keyAuthNote')}</p>
+                </div>
+              </div>
+              <Button variant="outline" onClick={() => setCreateDialogOpen(true)} className="shrink-0">
+                <Plus className="size-3.5" />
+                {t('apiKeys.createKey')}
+              </Button>
+            </CardContent>
+          </Card>
         </div>
+
+        <Modal
+          show={createDialogOpen}
+          title={t('apiKeys.createTitle')}
+          onClose={closeCreateDialog}
+          contentClassName="sm:max-w-[620px]"
+          footer={
+            <>
+              <Button type="button" variant="outline" onClick={closeCreateDialog} disabled={creating}>
+                {t('common.cancel')}
+              </Button>
+              <Button type="submit" form="create-api-key-form" disabled={creating}>
+                <Plus className="size-3.5" />
+                {creating ? t('apiKeys.creating') : t('apiKeys.createKey')}
+              </Button>
+            </>
+          }
+        >
+          <form id="create-api-key-form" className="space-y-5" onSubmit={(event) => void handleCreateKey(event)}>
+            <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/20 p-3">
+              <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <Plus className="size-4" />
+              </div>
+              <p className="text-sm leading-relaxed text-muted-foreground">{t('apiKeys.createDesc')}</p>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <FormField label={t('apiKeys.nameLabel')}>
+                <Input
+                  placeholder={t('apiKeys.keyNamePlaceholder')}
+                  value={createForm.name}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) => updateCreateForm({ name: event.target.value })}
+                />
+              </FormField>
+              <FormField label={t('apiKeys.keyLabel')}>
+                <Input
+                  placeholder={t('apiKeys.keyValuePlaceholder')}
+                  value={createForm.key}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) => updateCreateForm({ key: event.target.value })}
+                />
+              </FormField>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <FormField label={t('apiKeys.quotaLimitLabel')} icon={<CircleDollarSign className="size-3.5" />}>
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.000001"
+                  inputMode="decimal"
+                  placeholder={t('apiKeys.quotaLimitPlaceholder')}
+                  value={createForm.quotaLimit}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) => updateCreateForm({ quotaLimit: event.target.value })}
+                />
+              </FormField>
+              <FormField label={t('apiKeys.expireModeLabel')} icon={<CalendarClock className="size-3.5" />}>
+                <Select
+                  value={createForm.expireMode}
+                  onValueChange={(value) => updateCreateForm({ expireMode: value as ExpireMode })}
+                  options={expireOptions}
+                  compact
+                />
+              </FormField>
+            </div>
+
+            {createForm.expireMode === 'custom' ? (
+              <FormField label={t('apiKeys.expiresAtLabel')}>
+                <Input
+                  type="datetime-local"
+                  value={createForm.expiresAt}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) => updateCreateForm({ expiresAt: event.target.value })}
+                />
+              </FormField>
+            ) : null}
+          </form>
+        </Modal>
 
         <ToastNotice toast={toast} />
         {confirmDialog}
       </>
     </StateShell>
+  )
+}
+
+type Translator = (key: string, options?: Record<string, unknown>) => string
+
+function buildExpirationPayload(form: CreateKeyFormState, t: Translator): { expires_in_days?: number; expires_at?: string } {
+  if (form.expireMode === 'never') return {}
+  if (form.expireMode !== 'custom') {
+    return { expires_in_days: Number(form.expireMode) }
+  }
+  if (!form.expiresAt) {
+    throw new Error(t('apiKeys.expiresAtRequired'))
+  }
+  const date = new Date(form.expiresAt)
+  if (!Number.isFinite(date.getTime())) {
+    throw new Error(t('apiKeys.expiresAtInvalid'))
+  }
+  if (date.getTime() <= Date.now()) {
+    throw new Error(t('apiKeys.expiresAtPast'))
+  }
+  return { expires_at: date.toISOString() }
+}
+
+function getAPIKeyStatus(keyRow: APIKeyRow): 'active' | 'expired' | 'quota_exhausted' {
+  if (keyRow.status === 'expired' || keyRow.status === 'quota_exhausted') {
+    return keyRow.status
+  }
+  if (keyRow.expires_at && new Date(keyRow.expires_at).getTime() <= Date.now()) {
+    return 'expired'
+  }
+  if (keyRow.quota_limit > 0 && keyRow.quota_used >= keyRow.quota_limit) {
+    return 'quota_exhausted'
+  }
+  return 'active'
+}
+
+function formatQuotaLimit(keyRow: APIKeyRow, t: Translator) {
+  if (!keyRow.quota_limit || keyRow.quota_limit <= 0) {
+    return t('apiKeys.unlimited')
+  }
+  return t('apiKeys.quotaUsedOfLimit', {
+    used: formatUSD(keyRow.quota_used),
+    limit: formatUSD(keyRow.quota_limit),
+  })
+}
+
+function formatExpiration(keyRow: APIKeyRow, t: Translator) {
+  if (!keyRow.expires_at) {
+    return t('apiKeys.neverExpires')
+  }
+  return formatBeijingTime(keyRow.expires_at)
+}
+
+function formatUSD(value: number) {
+  if (!Number.isFinite(value)) return '$0'
+  if (value >= 1) return `$${value.toFixed(2)}`
+  if (value >= 0.01) return `$${value.toFixed(4)}`
+  return `$${value.toFixed(6)}`
+}
+
+function FormField({
+  label,
+  icon,
+  children,
+}: {
+  label: string
+  icon?: ReactNode
+  children: ReactNode
+}) {
+  return (
+    <label className="block min-w-0">
+      <span className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
+        {icon}
+        {label}
+      </span>
+      {children}
+    </label>
   )
 }
 

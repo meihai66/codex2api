@@ -10,7 +10,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { AccountRow, AddAccountRequest, AddATAccountRequest, AddOpenAIResponsesAccountRequest, UpdateOpenAIResponsesAccountRequest, APIKeyRow } from '../types'
+import type { AccountRow, AddAccountRequest, AddATAccountRequest, AddOpenAIResponsesAccountRequest, UpdateOpenAIResponsesAccountRequest, APIKeyRow, OpsOverviewResponse } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { formatCompactEmail } from '../lib/utils'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
@@ -29,9 +29,28 @@ import {
 import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy, Power, PowerOff, Hourglass, X, Replace } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
+import AccountQuotaDistributionChart from '../components/AccountQuotaDistributionChart'
+import AccountRateLimitRecoveryChart from '../components/AccountRateLimitRecoveryChart'
 
 const ACCOUNT_BATCH_CONCURRENCY = 6
 const ACCOUNT_REFRESH_BATCH_CONCURRENCY = 4
+const ACCOUNT_ANALYSIS_VISIBILITY_KEY = 'codex2api:accounts:analysis-visible'
+
+function getInitialAnalysisVisibility(): boolean {
+  try {
+    return window.localStorage.getItem(ACCOUNT_ANALYSIS_VISIBILITY_KEY) !== 'false'
+  } catch {
+    return true
+  }
+}
+
+function persistAnalysisVisibility(visible: boolean) {
+  try {
+    window.localStorage.setItem(ACCOUNT_ANALYSIS_VISIBILITY_KEY, visible ? 'true' : 'false')
+  } catch {
+    // Local storage can be unavailable in restricted browser modes; keep the in-memory toggle working.
+  }
+}
 
 function parseModelTokens(value: string): string[] {
   const seen = new Set<string>()
@@ -144,6 +163,7 @@ export default function Accounts() {
   const [showExportPicker, setShowExportPicker] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [showMigrate, setShowMigrate] = useState(false)
+  const [showAnalysisCharts, setShowAnalysisCharts] = useState(getInitialAnalysisVisibility)
   const [migrateUrl, setMigrateUrl] = useState('')
   const [migrateKey, setMigrateKey] = useState('')
   const [migrating, setMigrating] = useState(false)
@@ -176,23 +196,34 @@ export default function Accounts() {
   const { confirm, confirmDialog } = useConfirmDialog()
 
   const loadAccounts = useCallback(async () => {
-    const [accountsResponse, apiKeysResponse] = await Promise.all([api.getAccounts(), api.getAPIKeys()])
+    const [accountsResponse, apiKeysResponse, opsOverview] = await Promise.all([
+      api.getAccounts(),
+      api.getAPIKeys(),
+      api.getOpsOverview().catch((): OpsOverviewResponse | null => null),
+    ])
     return {
       accounts: accountsResponse.accounts ?? [],
       apiKeys: apiKeysResponse.keys ?? [],
+      opsOverview,
     }
   }, [])
 
-  const { data, loading, error, reload, reloadSilently } = useDataLoader<{ accounts: AccountRow[]; apiKeys: APIKeyRow[] }>({
+  const { data, loading, error, reload, reloadSilently } = useDataLoader<{ accounts: AccountRow[]; apiKeys: APIKeyRow[]; opsOverview: OpsOverviewResponse | null }>({
     initialData: {
       accounts: [],
       apiKeys: [],
+      opsOverview: null,
     },
     load: loadAccounts,
   })
   const accounts = data.accounts
   const apiKeys = data.apiKeys
+  const opsOverview = data.opsOverview
   const usageReloadAttemptsRef = useRef<Map<number, number>>(new Map())
+
+  useEffect(() => {
+    persistAnalysisVisibility(showAnalysisCharts)
+  }, [showAnalysisCharts])
 
   useEffect(() => {
     const needsUsageReload = (account: AccountRow) => {
@@ -1281,6 +1312,15 @@ export default function Accounts() {
           onRefresh={() => void reload()}
           actions={(
             <div className="flex flex-wrap items-center justify-end gap-1.5">
+              <Button
+                variant="outline"
+                aria-pressed={showAnalysisCharts}
+                onClick={() => setShowAnalysisCharts((visible) => !visible)}
+                className="max-sm:w-full"
+              >
+                <BarChart3 className="size-3.5" />
+                {showAnalysisCharts ? t('accounts.hideAnalysisCharts') : t('accounts.showAnalysisCharts')}
+              </Button>
               <HeaderActionMenu
                 label={t('accounts.maintenanceActions')}
                 icon={<Zap className="size-3.5" />}
@@ -1418,6 +1458,20 @@ export default function Accounts() {
           <CompactStat label={t('accounts.bannedAccounts')} chipLabel={t('accounts.filterBanned')} value={bannedAccounts} tone="danger" />
           <CompactStat label={t('accounts.errorAccounts')} chipLabel={t('accounts.filterError')} value={errorAccounts} tone="danger" />
         </div>
+
+        {showAnalysisCharts ? (
+          <div className="mb-4 grid items-stretch gap-4 xl:grid-cols-2">
+            <AccountQuotaDistributionChart accounts={accounts} compact className="min-w-0" />
+            <AccountRateLimitRecoveryChart
+              accounts={accounts}
+              currentRpm={opsOverview?.traffic?.rpm}
+              rpmLimit={opsOverview?.traffic?.rpm_limit}
+              avgDurationMs={opsOverview?.traffic?.avg_duration_ms}
+              compact
+              className="min-w-0"
+            />
+          </div>
+        ) : null}
 
         <div className="toolbar-surface mb-3 flex flex-wrap items-center gap-2">
           <span className="font-semibold text-foreground">{t('accounts.filter')}</span>

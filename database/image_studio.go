@@ -559,7 +559,7 @@ func normalizePage(page, pageSize int) (int, int) {
 }
 
 func (db *DB) GetAPIKeyByID(ctx context.Context, id int64) (*APIKeyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, name, key, created_at FROM api_keys WHERE id=$1`, id)
+	rows, err := db.conn.QueryContext(ctx, `SELECT `+apiKeySelectColumns+` FROM api_keys WHERE id=$1`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -571,7 +571,7 @@ func (db *DB) GetAPIKeyByID(ctx context.Context, id int64) (*APIKeyRow, error) {
 }
 
 func (db *DB) FirstAPIKey(ctx context.Context) (*APIKeyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, name, key, created_at FROM api_keys ORDER BY id LIMIT 1`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT `+apiKeySelectColumns+` FROM api_keys ORDER BY id LIMIT 1`)
 	if err != nil {
 		return nil, err
 	}
@@ -586,14 +586,19 @@ func scanAPIKeyRow(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*APIKeyRow, error) {
 	row := &APIKeyRow{}
-	var createdAtRaw interface{}
-	if err := scanner.Scan(&row.ID, &row.Name, &row.Key, &createdAtRaw); err != nil {
+	var createdAtRaw, expiresAtRaw interface{}
+	if err := scanner.Scan(&row.ID, &row.Name, &row.Key, &createdAtRaw, &row.QuotaLimit, &row.QuotaUsed, &expiresAtRaw); err != nil {
 		return nil, err
 	}
 	createdAt, err := parseDBTimeValue(createdAtRaw)
 	if err != nil {
 		return nil, fmt.Errorf("解析 API Key 创建时间失败: %w", err)
 	}
+	expiresAt, err := parseDBNullTimeValue(expiresAtRaw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 API Key 过期时间失败: %w", err)
+	}
 	row.CreatedAt = createdAt
+	row.ExpiresAt = expiresAt
 	return row, nil
 }

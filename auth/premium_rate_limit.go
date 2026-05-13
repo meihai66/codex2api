@@ -152,6 +152,7 @@ func (s *Store) MarkPremium5hRateLimited(acc *Account, resetAt time.Time) {
 	acc.mu.Unlock()
 
 	s.fastSchedulerUpdate(acc)
+	s.setCachedAccountCooldown(acc.DBID, "rate_limited", resetAt)
 
 	if s.db == nil {
 		return

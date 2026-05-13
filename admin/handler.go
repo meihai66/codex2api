@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -74,6 +75,77 @@ type chartCacheEntry struct {
 	expiresAt time.Time
 }
 
+const (
+	adminUsageStatsCacheNamespace = "admin:usage-stats"
+	adminChartCacheNamespace      = "admin:chart-data"
+	adminAPIKeyCacheNamespace     = "api-key"
+	adminAPIKeyCountNamespace     = "api-key-count"
+	adminUsageStatsCacheTTL       = 5 * time.Second
+	adminChartCacheTTL            = 10 * time.Second
+)
+
+func (h *Handler) getRuntimeJSON(ctx context.Context, namespace, key string, dest interface{}) bool {
+	if h == nil || h.cache == nil || dest == nil {
+		return false
+	}
+	raw, ok, err := h.cache.GetRuntime(ctx, namespace, key)
+	if err != nil {
+		log.Printf("读取运行态缓存失败: namespace=%s err=%v", namespace, err)
+		return false
+	}
+	if !ok || len(raw) == 0 {
+		return false
+	}
+	if err := json.Unmarshal(raw, dest); err != nil {
+		log.Printf("解析运行态缓存失败: namespace=%s err=%v", namespace, err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) setRuntimeJSON(ctx context.Context, namespace, key string, value interface{}, ttl time.Duration) {
+	if h == nil || h.cache == nil || value == nil {
+		return
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		log.Printf("编码运行态缓存失败: namespace=%s err=%v", namespace, err)
+		return
+	}
+	if err := h.cache.SetRuntime(ctx, namespace, key, payload, ttl); err != nil {
+		log.Printf("写入运行态缓存失败: namespace=%s err=%v", namespace, err)
+	}
+}
+
+func (h *Handler) deleteRuntimeCache(ctx context.Context, namespace, key string) {
+	if h == nil || h.cache == nil {
+		return
+	}
+	if err := h.cache.DeleteRuntime(ctx, namespace, key); err != nil {
+		log.Printf("删除运行态缓存失败: namespace=%s err=%v", namespace, err)
+	}
+}
+
+func (h *Handler) invalidateAPIKeyRuntimeCaches(ctx context.Context, apiKey string) {
+	h.deleteRuntimeCache(ctx, adminAPIKeyCountNamespace, "all")
+	if strings.TrimSpace(apiKey) != "" {
+		h.deleteRuntimeCache(ctx, adminAPIKeyCacheNamespace, apiKey)
+	}
+}
+
+func (h *Handler) getUsageStatsCached(ctx context.Context) (*database.UsageStats, error) {
+	var cached database.UsageStats
+	if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", &cached) {
+		return &cached, nil
+	}
+	stats, err := h.db.GetUsageStats(ctx)
+	if err != nil {
+		return nil, err
+	}
+	h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", stats, adminUsageStatsCacheTTL)
+	return stats, nil
+}
+
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
 	handler := &Handler{
@@ -90,6 +162,9 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		adminSecretEnv: adminSecretEnv,
 		imageProxy:     proxy.NewHandler(store, db, nil, nil),
 		chartCacheData: make(map[string]*chartCacheEntry),
+	}
+	if handler.imageProxy != nil {
+		handler.imageProxy.SetRuntimeCache(tc)
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
 	if db != nil {
@@ -155,6 +230,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/system/update", h.StartSelfUpdate)
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
+	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
@@ -285,7 +361,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 		}
 	}
 
-	usageStats, _ := h.db.GetUsageStats(ctx)
+	usageStats, _ := h.getUsageStatsCached(ctx)
 	todayReqs := int64(0)
 	if usageStats != nil {
 		todayReqs = usageStats.TodayRequests
@@ -379,6 +455,7 @@ type schedulerBreakdownResponse struct {
 	SuccessBonus        float64 `json:"success_bonus"`
 	UsagePenalty7d      float64 `json:"usage_penalty_7d"`
 	UsageUrgencyBonus5h float64 `json:"usage_urgency_bonus_5h"`
+	UsageUrgencyBonus7d float64 `json:"usage_urgency_bonus_7d"`
 	LatencyPenalty      float64 `json:"latency_penalty"`
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
@@ -502,6 +579,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				SuccessBonus:        debug.Breakdown.SuccessBonus,
 				UsagePenalty7d:      debug.Breakdown.UsagePenalty7d,
 				UsageUrgencyBonus5h: debug.Breakdown.UsageUrgencyBonus5h,
+				UsageUrgencyBonus7d: debug.Breakdown.UsageUrgencyBonus7d,
 				LatencyPenalty:      debug.Breakdown.LatencyPenalty,
 				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
 			}
@@ -1459,30 +1537,40 @@ func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL
 
 // importToken 导入时的统一 token 载体
 type importToken struct {
-	refreshToken string
-	sessionToken string
-	accessToken  string // AT-only 兼容路径
-	name         string
-	email        string
-	idToken      string
-	accountID    string
-	planType     string
-	expiresAt    string
+	refreshToken        string
+	sessionToken        string
+	accessToken         string // AT-only 兼容路径
+	name                string
+	email               string
+	idToken             string
+	accountID           string
+	planType            string
+	expiresAt           string
+	codex7DUsedPercent  string
+	codex7DResetAt      string
+	codex5HUsedPercent  string
+	codex5HResetAt      string
+	codexUsageUpdatedAt string
 }
 
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
-	RefreshToken      string                 `json:"refresh_token"`
-	SessionToken      string                 `json:"session_token"`
-	SessionTokenCamel string                 `json:"sessionToken"`
-	AccessToken       string                 `json:"access_token"`
-	IDToken           string                 `json:"id_token"`
-	AccountID         string                 `json:"account_id"`
-	Email             string                 `json:"email"`
-	Name              string                 `json:"name"`
-	PlanType          string                 `json:"plan_type"`
-	Expired           importJSONScalarString `json:"expired"`
-	ExpiresAt         importJSONScalarString `json:"expires_at"`
+	RefreshToken        string                 `json:"refresh_token"`
+	SessionToken        string                 `json:"session_token"`
+	SessionTokenCamel   string                 `json:"sessionToken"`
+	AccessToken         string                 `json:"access_token"`
+	IDToken             string                 `json:"id_token"`
+	AccountID           string                 `json:"account_id"`
+	Email               string                 `json:"email"`
+	Name                string                 `json:"name"`
+	PlanType            string                 `json:"plan_type"`
+	Codex7DUsedPercent  importJSONScalarString `json:"codex_7d_used_percent"`
+	Codex7DResetAt      string                 `json:"codex_7d_reset_at"`
+	Codex5HUsedPercent  importJSONScalarString `json:"codex_5h_used_percent"`
+	Codex5HResetAt      string                 `json:"codex_5h_reset_at"`
+	CodexUsageUpdatedAt string                 `json:"codex_usage_updated_at"`
+	Expired             importJSONScalarString `json:"expired"`
+	ExpiresAt           importJSONScalarString `json:"expires_at"`
 }
 
 type sub2apiImportPayload struct {
@@ -1495,16 +1583,21 @@ type sub2apiAccountEntry struct {
 }
 
 type sub2apiAccountCredentials struct {
-	RefreshToken      string                 `json:"refresh_token"`
-	SessionToken      string                 `json:"session_token"`
-	SessionTokenCamel string                 `json:"sessionToken"`
-	AccessToken       string                 `json:"access_token"`
-	IDToken           string                 `json:"id_token"`
-	AccountID         string                 `json:"account_id"`
-	Email             string                 `json:"email"`
-	PlanType          string                 `json:"plan_type"`
-	ExpiresAt         importJSONScalarString `json:"expires_at"`
-	Expired           importJSONScalarString `json:"expired"`
+	RefreshToken        string                 `json:"refresh_token"`
+	SessionToken        string                 `json:"session_token"`
+	SessionTokenCamel   string                 `json:"sessionToken"`
+	AccessToken         string                 `json:"access_token"`
+	IDToken             string                 `json:"id_token"`
+	AccountID           string                 `json:"account_id"`
+	Email               string                 `json:"email"`
+	PlanType            string                 `json:"plan_type"`
+	Codex7DUsedPercent  importJSONScalarString `json:"codex_7d_used_percent"`
+	Codex7DResetAt      string                 `json:"codex_7d_reset_at"`
+	Codex5HUsedPercent  importJSONScalarString `json:"codex_5h_used_percent"`
+	Codex5HResetAt      string                 `json:"codex_5h_reset_at"`
+	CodexUsageUpdatedAt string                 `json:"codex_usage_updated_at"`
+	ExpiresAt           importJSONScalarString `json:"expires_at"`
+	Expired             importJSONScalarString `json:"expired"`
 }
 
 type importJSONScalarString string
@@ -1585,15 +1678,20 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 
 		if rt != "" || st != "" || at != "" {
 			tokens = append(tokens, importToken{
-				refreshToken: rt,
-				sessionToken: st,
-				accessToken:  at,
-				name:         name,
-				email:        email,
-				idToken:      strings.TrimSpace(entry.IDToken),
-				accountID:    strings.TrimSpace(entry.AccountID),
-				planType:     strings.TrimSpace(entry.PlanType),
-				expiresAt:    firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String()),
+				refreshToken:        rt,
+				sessionToken:        st,
+				accessToken:         at,
+				name:                name,
+				email:               email,
+				idToken:             strings.TrimSpace(entry.IDToken),
+				accountID:           strings.TrimSpace(entry.AccountID),
+				planType:            strings.TrimSpace(entry.PlanType),
+				expiresAt:           firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String()),
+				codex7DUsedPercent:  strings.TrimSpace(entry.Codex7DUsedPercent.String()),
+				codex7DResetAt:      strings.TrimSpace(entry.Codex7DResetAt),
+				codex5HUsedPercent:  strings.TrimSpace(entry.Codex5HUsedPercent.String()),
+				codex5HResetAt:      strings.TrimSpace(entry.Codex5HResetAt),
+				codexUsageUpdatedAt: strings.TrimSpace(entry.CodexUsageUpdatedAt),
 			})
 		}
 	}
@@ -1620,15 +1718,20 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 
 		if rt != "" || st != "" || at != "" {
 			tokens = append(tokens, importToken{
-				refreshToken: rt,
-				sessionToken: st,
-				accessToken:  at,
-				name:         name,
-				email:        email,
-				idToken:      strings.TrimSpace(account.Credentials.IDToken),
-				accountID:    strings.TrimSpace(account.Credentials.AccountID),
-				planType:     strings.TrimSpace(account.Credentials.PlanType),
-				expiresAt:    firstNonEmpty(account.Credentials.ExpiresAt.String(), account.Credentials.Expired.String()),
+				refreshToken:        rt,
+				sessionToken:        st,
+				accessToken:         at,
+				name:                name,
+				email:               email,
+				idToken:             strings.TrimSpace(account.Credentials.IDToken),
+				accountID:           strings.TrimSpace(account.Credentials.AccountID),
+				planType:            strings.TrimSpace(account.Credentials.PlanType),
+				expiresAt:           firstNonEmpty(account.Credentials.ExpiresAt.String(), account.Credentials.Expired.String()),
+				codex7DUsedPercent:  strings.TrimSpace(account.Credentials.Codex7DUsedPercent.String()),
+				codex7DResetAt:      strings.TrimSpace(account.Credentials.Codex7DResetAt),
+				codex5HUsedPercent:  strings.TrimSpace(account.Credentials.Codex5HUsedPercent.String()),
+				codex5HResetAt:      strings.TrimSpace(account.Credentials.Codex5HResetAt),
+				codexUsageUpdatedAt: strings.TrimSpace(account.Credentials.CodexUsageUpdatedAt),
 			})
 		}
 	}
@@ -1976,13 +2079,18 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				bindCancel()
 
 				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-					sessionToken: tok.sessionToken,
-					accessToken:  tok.accessToken,
-					idToken:      tok.idToken,
-					accountID:    tok.accountID,
-					email:        tok.email,
-					planType:     tok.planType,
-					expiresAtRaw: tok.expiresAt,
+					sessionToken:        tok.sessionToken,
+					accessToken:         tok.accessToken,
+					idToken:             tok.idToken,
+					accountID:           tok.accountID,
+					email:               tok.email,
+					planType:            tok.planType,
+					expiresAtRaw:        tok.expiresAt,
+					codex7DUsedPercent:  tok.codex7DUsedPercent,
+					codex7DResetAt:      tok.codex7DResetAt,
+					codex5HUsedPercent:  tok.codex5HUsedPercent,
+					codex5HResetAt:      tok.codex5HResetAt,
+					codexUsageUpdatedAt: tok.codexUsageUpdatedAt,
 				})
 				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 				if len(tokenCredentialMap(seed)) > 0 {
@@ -2004,13 +2112,18 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					id, err = h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
 				} else {
 					seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-						sessionToken: tok.sessionToken,
-						accessToken:  tok.accessToken,
-						idToken:      tok.idToken,
-						accountID:    tok.accountID,
-						email:        tok.email,
-						planType:     tok.planType,
-						expiresAtRaw: tok.expiresAt,
+						sessionToken:        tok.sessionToken,
+						accessToken:         tok.accessToken,
+						idToken:             tok.idToken,
+						accountID:           tok.accountID,
+						email:               tok.email,
+						planType:            tok.planType,
+						expiresAtRaw:        tok.expiresAt,
+						codex7DUsedPercent:  tok.codex7DUsedPercent,
+						codex7DResetAt:      tok.codex7DResetAt,
+						codex5HUsedPercent:  tok.codex5HUsedPercent,
+						codex5HResetAt:      tok.codex5HResetAt,
+						codexUsageUpdatedAt: tok.codexUsageUpdatedAt,
 					})
 					id, err = h.db.InsertAccountWithCredentials(insertCtx, name, tokenCredentialMap(seed), proxyURL)
 				}
@@ -2031,14 +2144,19 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				bindCancel()
 
 				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-					refreshToken: tok.refreshToken,
-					sessionToken: tok.sessionToken,
-					accessToken:  tok.accessToken,
-					idToken:      tok.idToken,
-					accountID:    tok.accountID,
-					email:        tok.email,
-					planType:     tok.planType,
-					expiresAtRaw: tok.expiresAt,
+					refreshToken:        tok.refreshToken,
+					sessionToken:        tok.sessionToken,
+					accessToken:         tok.accessToken,
+					idToken:             tok.idToken,
+					accountID:           tok.accountID,
+					email:               tok.email,
+					planType:            tok.planType,
+					expiresAtRaw:        tok.expiresAt,
+					codex7DUsedPercent:  tok.codex7DUsedPercent,
+					codex7DResetAt:      tok.codex7DResetAt,
+					codex5HUsedPercent:  tok.codex5HUsedPercent,
+					codex5HResetAt:      tok.codex5HResetAt,
+					codexUsageUpdatedAt: tok.codexUsageUpdatedAt,
 				})
 				if len(tokenCredentialMap(seed)) > 0 {
 					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -2325,7 +2443,7 @@ func (h *Handler) GetUsageStats(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	stats, err := h.db.GetUsageStats(ctx)
+	stats, err := h.getUsageStatsCached(ctx)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -2363,17 +2481,31 @@ func (h *Handler) GetChartData(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
+	var cached database.ChartAggregation
+	if h.getRuntimeJSON(ctx, adminChartCacheNamespace, cacheKey, &cached) {
+		result := &cached
+		h.chartCacheMu.Lock()
+		h.chartCacheData[cacheKey] = &chartCacheEntry{
+			data:      result,
+			expiresAt: time.Now().Add(adminChartCacheTTL),
+		}
+		h.chartCacheMu.Unlock()
+		c.JSON(http.StatusOK, result)
+		return
+	}
+
 	result, err := h.db.GetChartAggregation(ctx, startTime, endTime, bucketMinutes)
 	if err != nil {
 		writeInternalError(c, err)
 		return
 	}
+	h.setRuntimeJSON(ctx, adminChartCacheNamespace, cacheKey, result, adminChartCacheTTL)
 
 	// 写入缓存
 	h.chartCacheMu.Lock()
 	h.chartCacheData[cacheKey] = &chartCacheEntry{
 		data:      result,
-		expiresAt: time.Now().Add(10 * time.Second),
+		expiresAt: time.Now().Add(adminChartCacheTTL),
 	}
 	// 清理过期条目（延迟清理，避免内存泄漏）
 	for k, v := range h.chartCacheData {
@@ -2486,6 +2618,72 @@ func parseOpsErrorLogFilter(c *gin.Context, withPaging bool) (database.UsageLogF
 	return filter, true
 }
 
+type opsErrorExportFile struct {
+	Version           int                   `json:"version"`
+	GeneratedAt       time.Time             `json:"generated_at"`
+	Range             opsErrorExportRange   `json:"range"`
+	Filters           opsErrorExportFilters `json:"filters"`
+	Options           opsErrorExportOptions `json:"options"`
+	TotalMatched      int                   `json:"total_matched"`
+	ExcludedCount     int                   `json:"excluded_count"`
+	ExportedCount     int                   `json:"exported_count"`
+	DuplicatesRemoved int                   `json:"duplicates_removed"`
+	Errors            []opsErrorExportEntry `json:"errors"`
+}
+
+type opsErrorExportRange struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+type opsErrorExportFilters struct {
+	Email        string `json:"email,omitempty"`
+	Model        string `json:"model,omitempty"`
+	Endpoint     string `json:"endpoint,omitempty"`
+	APIKeyID     *int64 `json:"api_key_id,omitempty"`
+	AccountID    *int64 `json:"account_id,omitempty"`
+	FastOnly     *bool  `json:"fast_only,omitempty"`
+	StreamOnly   *bool  `json:"stream_only,omitempty"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	StatusFamily string `json:"status_family,omitempty"`
+	ErrorKind    string `json:"error_kind,omitempty"`
+	Query        string `json:"query,omitempty"`
+}
+
+type opsErrorExportOptions struct {
+	Dedupe              bool  `json:"dedupe"`
+	ExcludedStatusCodes []int `json:"excluded_status_codes,omitempty"`
+}
+
+type opsErrorExportEntry struct {
+	Signature          string    `json:"signature"`
+	Occurrences        int       `json:"occurrences"`
+	FirstSeen          time.Time `json:"first_seen"`
+	LastSeen           time.Time `json:"last_seen"`
+	SampleIDs          []int64   `json:"sample_ids"`
+	AffectedAccountIDs []int64   `json:"affected_account_ids,omitempty"`
+	AffectedAPIKeyIDs  []int64   `json:"affected_api_key_ids,omitempty"`
+	ID                 int64     `json:"id"`
+	CreatedAt          time.Time `json:"created_at"`
+	StatusCode         int       `json:"status_code"`
+	ErrorKind          string    `json:"error_kind"`
+	ErrorMessage       string    `json:"error_message"`
+	AccountID          int64     `json:"account_id"`
+	AccountEmail       string    `json:"account_email"`
+	APIKeyID           int64     `json:"api_key_id"`
+	APIKeyName         string    `json:"api_key_name"`
+	APIKeyMasked       string    `json:"api_key_masked"`
+	Endpoint           string    `json:"endpoint"`
+	UpstreamEndpoint   string    `json:"upstream_endpoint"`
+	Model              string    `json:"model"`
+	EffectiveModel     string    `json:"effective_model"`
+	Stream             bool      `json:"stream"`
+	DurationMs         int       `json:"duration_ms"`
+	FirstTokenMs       int       `json:"first_token_ms"`
+	IsRetryAttempt     bool      `json:"is_retry_attempt"`
+	AttemptIndex       int       `json:"attempt_index"`
+}
+
 // GetOpsErrorLogs 获取运维错误日志
 func (h *Handler) GetOpsErrorLogs(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
@@ -2501,6 +2699,219 @@ func (h *Handler) GetOpsErrorLogs(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// ExportOpsErrorLogs 导出运维错误日志 JSON。
+func (h *Handler) ExportOpsErrorLogs(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	filter, ok := parseOpsErrorLogFilter(c, false)
+	if !ok {
+		return
+	}
+	dedupe := parseBoolQueryDefault(c, "dedupe", true)
+	excludedStatusCodes, excludedStatusSet, ok := parseExcludedStatusCodes(c.Query("exclude_status"))
+	if !ok {
+		writeError(c, http.StatusBadRequest, "exclude_status 参数无效")
+		return
+	}
+
+	logs, err := h.db.ListUsageLogsByFilter(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	exportFile := buildOpsErrorExportFile(logs, filter, dedupe, excludedStatusCodes, excludedStatusSet)
+	body, err := json.MarshalIndent(exportFile, "", "  ")
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	body = append(body, '\n')
+
+	filename := fmt.Sprintf("ops-errors-%s.json", time.Now().Format("20060102-150405"))
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+}
+
+func parseBoolQueryDefault(c *gin.Context, name string, fallback bool) bool {
+	raw := strings.ToLower(strings.TrimSpace(c.Query(name)))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func parseExcludedStatusCodes(raw string) ([]int, map[int]bool, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, map[int]bool{}, true
+	}
+	seen := map[int]bool{}
+	var statuses []int
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		code, err := strconv.Atoi(part)
+		if err != nil || code < 100 || code > 599 {
+			return nil, nil, false
+		}
+		if !seen[code] {
+			seen[code] = true
+			statuses = append(statuses, code)
+		}
+	}
+	sort.Ints(statuses)
+	return statuses, seen, true
+}
+
+func buildOpsErrorExportFile(logs []*database.UsageLog, filter database.UsageLogFilter, dedupe bool, excludedStatusCodes []int, excludedStatusSet map[int]bool) opsErrorExportFile {
+	exportFile := opsErrorExportFile{
+		Version:      1,
+		GeneratedAt:  time.Now(),
+		Range:        opsErrorExportRange{Start: filter.Start, End: filter.End},
+		Filters:      opsErrorExportFiltersFromUsageFilter(filter),
+		Options:      opsErrorExportOptions{Dedupe: dedupe, ExcludedStatusCodes: excludedStatusCodes},
+		TotalMatched: len(logs),
+		Errors:       []opsErrorExportEntry{},
+	}
+
+	filteredLogs := make([]*database.UsageLog, 0, len(logs))
+	for _, logRow := range logs {
+		if logRow == nil {
+			continue
+		}
+		if excludedStatusSet[logRow.StatusCode] {
+			exportFile.ExcludedCount++
+			continue
+		}
+		filteredLogs = append(filteredLogs, logRow)
+	}
+
+	if !dedupe {
+		for _, logRow := range filteredLogs {
+			entry := newOpsErrorExportEntry(logRow)
+			exportFile.Errors = append(exportFile.Errors, entry)
+		}
+		exportFile.ExportedCount = len(exportFile.Errors)
+		return exportFile
+	}
+
+	entryBySignature := make(map[string]int)
+	for _, logRow := range filteredLogs {
+		entry := newOpsErrorExportEntry(logRow)
+		if idx, exists := entryBySignature[entry.Signature]; exists {
+			exportFile.Errors[idx].merge(logRow)
+			continue
+		}
+		entryBySignature[entry.Signature] = len(exportFile.Errors)
+		exportFile.Errors = append(exportFile.Errors, entry)
+	}
+	sort.SliceStable(exportFile.Errors, func(i, j int) bool {
+		if exportFile.Errors[i].Occurrences != exportFile.Errors[j].Occurrences {
+			return exportFile.Errors[i].Occurrences > exportFile.Errors[j].Occurrences
+		}
+		return exportFile.Errors[i].LastSeen.After(exportFile.Errors[j].LastSeen)
+	})
+	exportFile.ExportedCount = len(exportFile.Errors)
+	exportFile.DuplicatesRemoved = len(filteredLogs) - len(exportFile.Errors)
+	return exportFile
+}
+
+func opsErrorExportFiltersFromUsageFilter(filter database.UsageLogFilter) opsErrorExportFilters {
+	return opsErrorExportFilters{
+		Email:        filter.Email,
+		Model:        filter.Model,
+		Endpoint:     filter.Endpoint,
+		APIKeyID:     filter.APIKeyID,
+		AccountID:    filter.AccountID,
+		FastOnly:     filter.FastOnly,
+		StreamOnly:   filter.StreamOnly,
+		StatusCode:   filter.StatusCode,
+		StatusFamily: filter.StatusFamily,
+		ErrorKind:    filter.ErrorKind,
+		Query:        filter.Query,
+	}
+}
+
+func newOpsErrorExportEntry(logRow *database.UsageLog) opsErrorExportEntry {
+	entry := opsErrorExportEntry{
+		Signature:          opsErrorSignature(logRow),
+		Occurrences:        1,
+		FirstSeen:          logRow.CreatedAt,
+		LastSeen:           logRow.CreatedAt,
+		SampleIDs:          []int64{logRow.ID},
+		AffectedAccountIDs: appendUniqueInt64(nil, logRow.AccountID, 50),
+		AffectedAPIKeyIDs:  appendUniqueInt64(nil, logRow.APIKeyID, 50),
+		ID:                 logRow.ID,
+		CreatedAt:          logRow.CreatedAt,
+		StatusCode:         logRow.StatusCode,
+		ErrorKind:          logRow.UpstreamErrorKind,
+		ErrorMessage:       logRow.ErrorMessage,
+		AccountID:          logRow.AccountID,
+		AccountEmail:       logRow.AccountEmail,
+		APIKeyID:           logRow.APIKeyID,
+		APIKeyName:         logRow.APIKeyName,
+		APIKeyMasked:       logRow.APIKeyMasked,
+		Endpoint:           firstNonEmpty(logRow.InboundEndpoint, logRow.Endpoint),
+		UpstreamEndpoint:   logRow.UpstreamEndpoint,
+		Model:              logRow.Model,
+		EffectiveModel:     logRow.EffectiveModel,
+		Stream:             logRow.Stream,
+		DurationMs:         logRow.DurationMs,
+		FirstTokenMs:       logRow.FirstTokenMs,
+		IsRetryAttempt:     logRow.IsRetryAttempt,
+		AttemptIndex:       logRow.AttemptIndex,
+	}
+	return entry
+}
+
+func (entry *opsErrorExportEntry) merge(logRow *database.UsageLog) {
+	entry.Occurrences++
+	if logRow.CreatedAt.Before(entry.FirstSeen) {
+		entry.FirstSeen = logRow.CreatedAt
+	}
+	if logRow.CreatedAt.After(entry.LastSeen) {
+		entry.LastSeen = logRow.CreatedAt
+	}
+	entry.SampleIDs = appendUniqueInt64(entry.SampleIDs, logRow.ID, 20)
+	entry.AffectedAccountIDs = appendUniqueInt64(entry.AffectedAccountIDs, logRow.AccountID, 50)
+	entry.AffectedAPIKeyIDs = appendUniqueInt64(entry.AffectedAPIKeyIDs, logRow.APIKeyID, 50)
+}
+
+func opsErrorSignature(logRow *database.UsageLog) string {
+	parts := []string{
+		strconv.Itoa(logRow.StatusCode),
+		strings.TrimSpace(logRow.UpstreamErrorKind),
+		strings.Join(strings.Fields(logRow.ErrorMessage), " "),
+		firstNonEmpty(logRow.InboundEndpoint, logRow.Endpoint),
+		strings.TrimSpace(logRow.UpstreamEndpoint),
+		strings.TrimSpace(logRow.Model),
+		strings.TrimSpace(logRow.EffectiveModel),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x1f")))
+	return hex.EncodeToString(sum[:12])
+}
+
+func appendUniqueInt64(values []int64, value int64, limit int) []int64 {
+	if value <= 0 || (limit > 0 && len(values) >= limit) {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 // GetOpsErrorSummary 获取运维错误日志概览
@@ -2623,6 +3034,10 @@ func (h *Handler) ClearUsageLogs(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	h.deleteRuntimeCache(ctx, adminUsageStatsCacheNamespace, "global")
+	h.chartCacheMu.Lock()
+	h.chartCacheData = make(map[string]*chartCacheEntry)
+	h.chartCacheMu.Unlock()
 	c.JSON(http.StatusOK, gin.H{"message": "日志已清空"})
 }
 
@@ -2649,8 +3064,12 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 }
 
 type createKeyReq struct {
-	Name string `json:"name"`
-	Key  string `json:"key"`
+	Name          string   `json:"name"`
+	Key           string   `json:"key"`
+	QuotaLimit    *float64 `json:"quota_limit"`
+	Quota         *float64 `json:"quota"`
+	ExpiresAt     string   `json:"expires_at"`
+	ExpiresInDays *int     `json:"expires_in_days"`
 }
 
 // generateKey 生成随机 API Key
@@ -2685,6 +3104,28 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		return
 	}
 
+	quotaLimit := 0.0
+	if req.Quota != nil {
+		quotaLimit = *req.Quota
+	}
+	if req.QuotaLimit != nil {
+		quotaLimit = *req.QuotaLimit
+	}
+	if quotaLimit < 0 {
+		writeError(c, http.StatusBadRequest, "额度限制不能小于 0")
+		return
+	}
+	if quotaLimit > 1000000000 {
+		writeError(c, http.StatusBadRequest, "额度限制过大")
+		return
+	}
+
+	expiresAt, err := parseAPIKeyExpiresAt(req.ExpiresAt, req.ExpiresInDays)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	key := req.Key
 	if key == "" {
 		key = generateKey()
@@ -2700,20 +3141,72 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	id, err := h.db.InsertAPIKey(ctx, req.Name, key)
+	id, err := h.db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
+		Name:       req.Name,
+		Key:        key,
+		QuotaLimit: quotaLimit,
+		ExpiresAt:  expiresAt,
+	})
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "创建失败: "+err.Error())
 		return
 	}
+	h.invalidateAPIKeyRuntimeCaches(ctx, key)
 
 	// 记录安全审计日志
 	security.SecurityAuditLog("API_KEY_CREATED", fmt.Sprintf("id=%d name=%s ip=%s", id, security.SanitizeLog(req.Name), c.ClientIP()))
 
+	var expiresAtResponse *string
+	if expiresAt.Valid {
+		formatted := expiresAt.Time.Format(time.RFC3339)
+		expiresAtResponse = &formatted
+	}
 	c.JSON(http.StatusOK, createAPIKeyResponse{
-		ID:   id,
-		Key:  key,
-		Name: req.Name,
+		ID:         id,
+		Key:        key,
+		Name:       req.Name,
+		QuotaLimit: quotaLimit,
+		QuotaUsed:  0,
+		ExpiresAt:  expiresAtResponse,
 	})
+}
+
+func parseAPIKeyExpiresAt(raw string, expiresInDays *int) (sql.NullTime, error) {
+	if expiresInDays != nil {
+		if *expiresInDays < 0 {
+			return sql.NullTime{}, fmt.Errorf("过期天数不能小于 0")
+		}
+		if *expiresInDays > 0 {
+			if *expiresInDays > 3650 {
+				return sql.NullTime{}, fmt.Errorf("过期天数不能超过 3650 天")
+			}
+			return sql.NullTime{Time: time.Now().AddDate(0, 0, *expiresInDays), Valid: true}, nil
+		}
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return sql.NullTime{}, nil
+	}
+	layouts := []string{time.RFC3339, "2006-01-02T15:04", "2006-01-02 15:04", "2006-01-02"}
+	var parsed time.Time
+	var err error
+	for _, layout := range layouts {
+		if layout == time.RFC3339 {
+			parsed, err = time.Parse(layout, raw)
+		} else {
+			parsed, err = time.ParseInLocation(layout, raw, time.Local)
+		}
+		if err == nil {
+			if layout == "2006-01-02" {
+				parsed = parsed.Add(24*time.Hour - time.Nanosecond)
+			}
+			if !parsed.After(time.Now()) {
+				return sql.NullTime{}, fmt.Errorf("过期时间必须晚于当前时间")
+			}
+			return sql.NullTime{Time: parsed, Valid: true}, nil
+		}
+	}
+	return sql.NullTime{}, fmt.Errorf("过期时间格式无效")
 }
 
 // DeleteAPIKey 删除 API 密钥
@@ -2727,10 +3220,15 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
+	keyToInvalidate := ""
+	if row, err := h.db.GetAPIKeyByID(ctx, id); err == nil && row != nil {
+		keyToInvalidate = row.Key
+	}
 	if err := h.db.DeleteAPIKey(ctx, id); err != nil {
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
+	h.invalidateAPIKeyRuntimeCaches(ctx, keyToInvalidate)
 	writeMessage(c, http.StatusOK, "已删除")
 }
 
@@ -3586,14 +4084,20 @@ func (h *Handler) TestImageStorageConnection(c *gin.Context) {
 // ==================== 导出 & 迁移 ====================
 
 type cpaExportEntry struct {
-	Type         string `json:"type"`
-	Email        string `json:"email"`
-	Expired      string `json:"expired"`
-	IDToken      string `json:"id_token"`
-	AccountID    string `json:"account_id"`
-	AccessToken  string `json:"access_token"`
-	LastRefresh  string `json:"last_refresh"`
-	RefreshToken string `json:"refresh_token"`
+	Type                string `json:"type"`
+	Email               string `json:"email"`
+	PlanType            string `json:"plan_type,omitempty"`
+	Codex7DUsedPercent  string `json:"codex_7d_used_percent,omitempty"`
+	Codex7DResetAt      string `json:"codex_7d_reset_at,omitempty"`
+	Codex5HUsedPercent  string `json:"codex_5h_used_percent,omitempty"`
+	Codex5HResetAt      string `json:"codex_5h_reset_at,omitempty"`
+	CodexUsageUpdatedAt string `json:"codex_usage_updated_at,omitempty"`
+	Expired             string `json:"expired"`
+	IDToken             string `json:"id_token"`
+	AccountID           string `json:"account_id"`
+	AccessToken         string `json:"access_token"`
+	LastRefresh         string `json:"last_refresh"`
+	RefreshToken        string `json:"refresh_token"`
 }
 
 type accountAuthJSONTokens struct {
@@ -3730,18 +4234,27 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 			}
 		}
 		rt := row.GetCredential("refresh_token")
-		if rt == "" {
+		at := row.GetCredential("access_token")
+		// AT-only accounts (没有 refresh_token,只靠 access_token,常用于规避
+		// add-phone 的 Plus 号) 也需要可导出与可迁移。仅当两个凭证都缺失才跳过。
+		if rt == "" && at == "" {
 			continue
 		}
 		entries = append(entries, cpaExportEntry{
-			Type:         "codex",
-			Email:        row.GetCredential("email"),
-			Expired:      row.GetCredential("expires_at"),
-			IDToken:      row.GetCredential("id_token"),
-			AccountID:    row.GetCredential("account_id"),
-			AccessToken:  row.GetCredential("access_token"),
-			LastRefresh:  row.UpdatedAt.Format(time.RFC3339),
-			RefreshToken: rt,
+			Type:                "codex",
+			Email:               row.GetCredential("email"),
+			PlanType:            row.GetCredential("plan_type"),
+			Codex7DUsedPercent:  row.GetCredential("codex_7d_used_percent"),
+			Codex7DResetAt:      row.GetCredential("codex_7d_reset_at"),
+			Codex5HUsedPercent:  row.GetCredential("codex_5h_used_percent"),
+			Codex5HResetAt:      row.GetCredential("codex_5h_reset_at"),
+			CodexUsageUpdatedAt: row.GetCredential("codex_usage_updated_at"),
+			Expired:             row.GetCredential("expires_at"),
+			IDToken:             row.GetCredential("id_token"),
+			AccountID:           row.GetCredential("account_id"),
+			AccessToken:         at,
+			LastRefresh:         row.UpdatedAt.Format(time.RFC3339),
+			RefreshToken:        rt,
 		})
 	}
 
@@ -3810,11 +4323,13 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 		return
 	}
 
-	// 转换为 importToken 格式，复用 importAccountsCommon
+	// 转换为 importToken 格式，复用 importAccountsCommon (原生支持 AT-only 混合导入)
 	var tokens []importToken
 	for _, entry := range remoteAccounts {
 		rt := strings.TrimSpace(entry.RefreshToken)
-		if rt == "" {
+		at := strings.TrimSpace(entry.AccessToken)
+		// 至少需要一种凭证;两者都为空表示账号根本没有可用凭证。
+		if rt == "" && at == "" {
 			continue
 		}
 		name := entry.Email
@@ -3822,13 +4337,19 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 			name = "migrate"
 		}
 		tokens = append(tokens, importToken{
-			refreshToken: rt,
-			accessToken:  strings.TrimSpace(entry.AccessToken),
-			name:         name,
-			email:        strings.TrimSpace(entry.Email),
-			idToken:      strings.TrimSpace(entry.IDToken),
-			accountID:    strings.TrimSpace(entry.AccountID),
-			expiresAt:    strings.TrimSpace(entry.Expired),
+			refreshToken:        rt,
+			accessToken:         at,
+			name:                name,
+			email:               strings.TrimSpace(entry.Email),
+			idToken:             strings.TrimSpace(entry.IDToken),
+			accountID:           strings.TrimSpace(entry.AccountID),
+			planType:            strings.TrimSpace(entry.PlanType),
+			expiresAt:           strings.TrimSpace(entry.Expired),
+			codex7DUsedPercent:  strings.TrimSpace(entry.Codex7DUsedPercent),
+			codex7DResetAt:      strings.TrimSpace(entry.Codex7DResetAt),
+			codex5HUsedPercent:  strings.TrimSpace(entry.Codex5HUsedPercent),
+			codex5HResetAt:      strings.TrimSpace(entry.Codex5HResetAt),
+			codexUsageUpdatedAt: strings.TrimSpace(entry.CodexUsageUpdatedAt),
 		})
 	}
 

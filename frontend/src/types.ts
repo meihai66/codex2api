@@ -52,6 +52,7 @@ export interface AccountRow {
     success_bonus: number
     usage_penalty_7d: number
     usage_urgency_bonus_5h?: number
+    usage_urgency_bonus_7d?: number
     latency_penalty: number
     success_rate_penalty?: number
   }
@@ -260,6 +261,7 @@ export interface OpsOverviewResponse {
     today_requests: number
     today_tokens: number
     rpm_limit: number
+    avg_duration_ms: number
   }
 }
 
@@ -439,6 +441,8 @@ export interface UsageStats {
   total_cached_tokens: number
   total_account_billed: number
   total_user_billed: number
+  avg_account_billed_per_request: number
+  avg_user_billed_per_request: number
   today_requests: number
   today_tokens: number
   today_account_billed: number
@@ -447,6 +451,50 @@ export interface UsageStats {
   tpm: number
   avg_duration_ms: number
   error_rate: number
+  feature_stats: UsageFeatureStats
+  model_stats: UsageModelStat[]
+  endpoint_stats: UsageEndpointStat[]
+  api_key_stats: UsageAPIKeyStat[]
+}
+
+export interface UsageModelStat {
+  model: string
+  requests: number
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  account_billed: number
+  user_billed: number
+  error_count: number
+}
+
+export interface UsageFeatureStats {
+  stream_requests: number
+  sync_requests: number
+  fast_requests: number
+  cache_hit_requests: number
+  reasoning_requests: number
+  image_requests: number
+  retry_requests: number
+  error_requests: number
+}
+
+export interface UsageEndpointStat {
+  endpoint: string
+  requests: number
+  tokens: number
+  error_count: number
+  user_billed: number
+}
+
+export interface UsageAPIKeyStat {
+  api_key_id: number
+  label: string
+  requests: number
+  tokens: number
+  error_count: number
+  user_billed: number
 }
 
 export interface UsageLog {
@@ -543,15 +591,30 @@ export interface APIKeyRow {
   name: string
   key: string
   raw_key: string
+  quota_limit: number
+  quota_used: number
+  expires_at?: ISODateString | null
+  status?: 'active' | 'expired' | 'quota_exhausted'
   created_at: ISODateString
 }
 
 export type APIKeysResponse = ApiListResponse<'keys', APIKeyRow>
 
+export interface CreateAPIKeyRequest {
+  name: string
+  key?: string
+  quota_limit?: number
+  expires_at?: string
+  expires_in_days?: number
+}
+
 export interface CreateAPIKeyResponse {
   id: number
   key: string
   name: string
+  quota_limit: number
+  quota_used: number
+  expires_at?: ISODateString | null
 }
 
 export interface ImagePromptTemplate {

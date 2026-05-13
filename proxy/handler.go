@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,12 +10,12 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
+	"github.com/codex2api/cache"
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
@@ -31,11 +32,24 @@ type Handler struct {
 	db         *database.DB
 	cfg        *config.Config       // 全局配置
 	deviceCfg  *DeviceProfileConfig // 设备指纹配置
+	cache      cache.TokenCache     // Redis/Memory 运行态缓存
+}
 
-	// 动态 key 缓存
-	dbKeysMu    sync.RWMutex
-	dbKeys      map[string]*database.APIKeyRow
-	dbKeysUntil time.Time
+const (
+	apiKeyCacheNamespace      = "api-key"
+	apiKeyCountCacheNamespace = "api-key-count"
+	apiKeyCacheTTL            = 5 * time.Minute
+	apiKeyCountCacheTTL       = 30 * time.Second
+)
+
+type apiKeyRuntimeRecord struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type apiKeyCountRuntimeRecord struct {
+	Count int `json:"count"`
 }
 
 func (h *Handler) nextAccountForSession(sessionID string, apiKeyID int64, exclude map[int64]bool) (*auth.Account, string) {
@@ -75,6 +89,13 @@ func (h *Handler) composeRequireBindingFilter(base auth.AccountFilter) auth.Acco
 		}
 		return h.store.HasProxyBinding(acc.ID())
 	}
+}
+
+func (h *Handler) withModelCooldownFilter(model string, filter auth.AccountFilter) auth.AccountFilter {
+	if h == nil || h.store == nil {
+		return filter
+	}
+	return h.store.WithModelCooldownFilter(model, filter)
 }
 
 func (h *Handler) shouldUseWebsocketForHTTP() bool {
@@ -334,50 +355,24 @@ func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCf
 	}
 }
 
+// SetRuntimeCache wires Redis/Memory runtime cache for hot auth metadata.
+func (h *Handler) SetRuntimeCache(tc cache.TokenCache) {
+	if h == nil {
+		return
+	}
+	h.cache = tc
+}
+
 // NewHandlerWithDeviceProfile 创建处理器（带设备指纹配置）
 func NewHandlerWithDeviceProfile(store *auth.Store, db *database.DB, deviceCfg *DeviceProfileConfig) *Handler {
 	return NewHandler(store, db, nil, deviceCfg)
 }
 
-// refreshDBKeys 从数据库刷新密钥缓存（5 分钟）
-func (h *Handler) refreshDBKeys() map[string]*database.APIKeyRow {
-	h.dbKeysMu.RLock()
-	if time.Now().Before(h.dbKeysUntil) {
-		keys := h.dbKeys
-		h.dbKeysMu.RUnlock()
-		return keys
-	}
-	h.dbKeysMu.RUnlock()
-
-	h.dbKeysMu.Lock()
-	defer h.dbKeysMu.Unlock()
-
-	// double check
-	if time.Now().Before(h.dbKeysUntil) {
-		return h.dbKeys
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	rows, err := h.db.ListAPIKeys(ctx)
-	if err != nil {
-		log.Printf("刷新 API Keys 缓存失败: %v", err)
-		return h.dbKeys
-	}
-
-	newMap := make(map[string]*database.APIKeyRow, len(rows))
-	for _, row := range rows {
-		if row == nil || row.Key == "" {
-			continue
-		}
-		newMap[row.Key] = row
-	}
-	h.dbKeys = newMap
-	h.dbKeysUntil = time.Now().Add(5 * time.Minute)
-	return newMap
-}
-
 func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, false
+	}
 	if h.configKeys[key] {
 		return &database.APIKeyRow{
 			ID:   0,
@@ -385,9 +380,76 @@ func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool) {
 			Key:  key,
 		}, true
 	}
-	dbKeys := h.refreshDBKeys()
-	row, ok := dbKeys[key]
-	return row, ok
+	if row, ok := h.resolveAPIKeyFromRuntimeCache(key); ok {
+		return row, true
+	}
+	if h.db == nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	row, err := h.db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			log.Printf("查询 API Key 失败: %v", err)
+		}
+		return nil, false
+	}
+	h.setAPIKeyRuntimeCache(row)
+	return row, true
+}
+
+func (h *Handler) resolveAPIKeyFromRuntimeCache(key string) (*database.APIKeyRow, bool) {
+	if h == nil || h.cache == nil {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	raw, ok, err := h.cache.GetRuntime(ctx, apiKeyCacheNamespace, key)
+	if err != nil {
+		log.Printf("读取 API Key Redis 缓存失败: %v", err)
+		return nil, false
+	}
+	if !ok || len(raw) == 0 {
+		return nil, false
+	}
+	var record apiKeyRuntimeRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		log.Printf("解析 API Key Redis 缓存失败: %v", err)
+		return nil, false
+	}
+	if record.ID <= 0 {
+		return nil, false
+	}
+	return &database.APIKeyRow{
+		ID:        record.ID,
+		Name:      record.Name,
+		Key:       key,
+		CreatedAt: record.CreatedAt,
+	}, true
+}
+
+func (h *Handler) setAPIKeyRuntimeCache(row *database.APIKeyRow) {
+	if h == nil || h.cache == nil || row == nil || strings.TrimSpace(row.Key) == "" || row.ID <= 0 {
+		return
+	}
+	if row.HasAccessConstraints() {
+		return
+	}
+	record := apiKeyRuntimeRecord{
+		ID:        row.ID,
+		Name:      row.Name,
+		CreatedAt: row.CreatedAt,
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := h.cache.SetRuntime(ctx, apiKeyCacheNamespace, row.Key, payload, apiKeyCacheTTL); err != nil {
+		log.Printf("写入 API Key Redis 缓存失败: id=%d err=%v", row.ID, err)
+	}
 }
 
 // isValidKey 检查 key 是否有效（配置文件 + DB）
@@ -401,8 +463,38 @@ func (h *Handler) hasAnyKeys() bool {
 	if len(h.configKeys) > 0 {
 		return true
 	}
-	dbKeys := h.refreshDBKeys()
-	return len(dbKeys) > 0
+	if h.cache != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		raw, ok, err := h.cache.GetRuntime(ctx, apiKeyCountCacheNamespace, "all")
+		cancel()
+		if err != nil {
+			log.Printf("读取 API Key 数量缓存失败: %v", err)
+		} else if ok {
+			var record apiKeyCountRuntimeRecord
+			if err := json.Unmarshal(raw, &record); err == nil {
+				return record.Count > 0
+			}
+		}
+	}
+	if h.db == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	count, err := h.db.CountAPIKeys(ctx)
+	if err != nil {
+		log.Printf("统计 API Key 数量失败: %v", err)
+		return false
+	}
+	if h.cache != nil {
+		payload, _ := json.Marshal(apiKeyCountRuntimeRecord{Count: count})
+		cacheCtx, cacheCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		if err := h.cache.SetRuntime(cacheCtx, apiKeyCountCacheNamespace, "all", payload, apiKeyCountCacheTTL); err != nil {
+			log.Printf("写入 API Key 数量缓存失败: %v", err)
+		}
+		cacheCancel()
+	}
+	return count > 0
 }
 
 // logUsage 记录请求日志（非阻塞，写入内存缓冲由后台批量 flush）
@@ -540,6 +632,66 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 	}
 }
 
+func classifyResponseFailedOutcome(payload []byte) streamOutcome {
+	statusCode := responseFailedStatusCode(payload)
+	message := usageLogErrorMessage(statusCode, payload)
+	if strings.TrimSpace(message) == "" || message == fmt.Sprintf("HTTP %d", statusCode) {
+		message = "上游返回 response.failed"
+	}
+	kind := upstreamErrorKind(statusCode, payload, codex429Decision{})
+	if kind == "" {
+		if statusCode >= 500 {
+			kind = "server"
+		} else {
+			kind = "client"
+		}
+	}
+	return streamOutcome{
+		logStatusCode:  statusCode,
+		failureKind:    kind,
+		failureMessage: message,
+		penalize:       statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500,
+	}
+}
+
+func responseFailedStatusCode(payload []byte) int {
+	for _, path := range []string{
+		"response.status_code",
+		"response.error.status_code",
+		"response.status_details.error.status_code",
+		"status_code",
+		"error.status_code",
+	} {
+		code := int(gjson.GetBytes(payload, path).Int())
+		if code >= 400 && code <= 599 {
+			return code
+		}
+	}
+
+	codeOrType := strings.ToLower(strings.Join([]string{
+		gjson.GetBytes(payload, "response.error.code").String(),
+		gjson.GetBytes(payload, "response.error.type").String(),
+		gjson.GetBytes(payload, "response.status_details.error.code").String(),
+		gjson.GetBytes(payload, "response.status_details.error.type").String(),
+		gjson.GetBytes(payload, "error.code").String(),
+		gjson.GetBytes(payload, "error.type").String(),
+	}, " "))
+	switch {
+	case strings.Contains(codeOrType, "rate_limit"):
+		return http.StatusTooManyRequests
+	case strings.Contains(codeOrType, "unauthorized") || strings.Contains(codeOrType, "invalid_api_key"):
+		return http.StatusUnauthorized
+	case strings.Contains(codeOrType, "payment"):
+		return http.StatusPaymentRequired
+	case strings.Contains(codeOrType, "forbidden"):
+		return http.StatusForbidden
+	case strings.Contains(codeOrType, "invalid") || strings.Contains(codeOrType, "bad_request"):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries int, wroteAnyBody bool, ctxErr, writeErr error) bool {
 	if attempt >= maxRetries {
 		return false
@@ -593,6 +745,76 @@ func extractResponseImageGenerationOutput(data []byte, seen map[string]struct{})
 		}
 	}
 	return json.RawMessage(raw), true
+}
+
+func responseOutputItemDoneKey(item gjson.Result) string {
+	if key := strings.TrimSpace(item.Get("id").String()); key != "" {
+		return key
+	}
+	return strings.TrimSpace(item.Get("type").String()) + "|" + strings.TrimSpace(item.Raw)
+}
+
+func extractResponseOutputItemDone(data []byte, seen map[string]struct{}) (json.RawMessage, bool) {
+	if len(data) == 0 || !gjson.ValidBytes(data) {
+		return nil, false
+	}
+	if gjson.GetBytes(data, "type").String() != "response.output_item.done" {
+		return nil, false
+	}
+	item := gjson.GetBytes(data, "item")
+	if !item.Exists() || !item.IsObject() {
+		return nil, false
+	}
+	key := responseOutputItemDoneKey(item)
+	if key != "" && seen != nil {
+		if _, ok := seen[key]; ok {
+			return nil, false
+		}
+		seen[key] = struct{}{}
+	}
+	raw := []byte(item.Raw)
+	if item.Get("type").String() == "image_generation_call" {
+		var output map[string]any
+		if err := json.Unmarshal(raw, &output); err == nil && addImageStatsToMap(output) {
+			if annotated, err := json.Marshal(output); err == nil {
+				raw = annotated
+			}
+		}
+	}
+	return json.RawMessage(raw), true
+}
+
+func restoreMissingResponseOutputs(responseJSON []byte, outputItems []json.RawMessage) []byte {
+	if len(responseJSON) == 0 || len(outputItems) == 0 {
+		return responseJSON
+	}
+	var response map[string]any
+	if err := json.Unmarshal(responseJSON, &response); err != nil {
+		return responseJSON
+	}
+	if outputs, ok := response["output"].([]any); ok && len(outputs) > 0 {
+		return responseJSON
+	}
+	outputs := make([]any, 0, len(outputItems))
+	for _, rawItem := range outputItems {
+		if len(rawItem) == 0 || !gjson.ValidBytes(rawItem) {
+			continue
+		}
+		var decoded any
+		if err := json.Unmarshal(rawItem, &decoded); err != nil {
+			continue
+		}
+		outputs = append(outputs, decoded)
+	}
+	if len(outputs) == 0 {
+		return responseJSON
+	}
+	response["output"] = outputs
+	restored, err := json.Marshal(response)
+	if err != nil {
+		return responseJSON
+	}
+	return restored
 }
 
 func appendMissingResponseImageOutputs(responseJSON []byte, imageOutputs []json.RawMessage) []byte {
@@ -756,6 +978,20 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 			security.SecurityAuditLog("AUTH_FAILED", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
 			// Use standardized error format from api package
 			api.SendError(c, api.ErrInvalidAPIKey)
+			c.Abort()
+			return
+		}
+		if apiKeyRow.IsExpired(time.Now()) {
+			maskedKey := security.MaskAPIKey(key)
+			security.SecurityAuditLog("AUTH_FAILED_EXPIRED_KEY", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
+			api.SendError(c, api.NewAPIError(api.ErrCodeInvalidAuth, "API key has expired", api.ErrorTypeAuthentication))
+			c.Abort()
+			return
+		}
+		if apiKeyRow.IsQuotaExhausted() {
+			maskedKey := security.MaskAPIKey(key)
+			security.SecurityAuditLog("AUTH_FAILED_QUOTA_EXHAUSTED", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
+			api.SendError(c, api.NewAPIError(api.ErrCodeRateLimitReached, "API key quota exhausted", api.ErrorTypeRateLimit))
 			c.Abort()
 			return
 		}
@@ -947,12 +1183,14 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	// 2. 准备上游请求体（Unmarshal→map→Marshal，一次序列化）
 	codexBody, expandedInputRaw := PrepareResponsesBody(rawBody)
+	openAIResponsesBody := PrepareOpenAIResponsesBody(rawBody)
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -962,6 +1200,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
+	invalidEncryptedContentRetried := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -1015,7 +1254,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			lastUpstreamCancel = upstreamCancel
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
-			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, rawBody, proxyURL, downstreamHeaders)
+			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, openAIResponsesBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
@@ -1040,11 +1279,32 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			if resp.StatusCode != http.StatusOK {
+				errBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
+					strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+					if rawChanged || codexChanged {
+						invalidEncryptedContentRetried = true
+						if rawChanged {
+							rawBody = strippedRawBody
+							openAIResponsesBody = PrepareOpenAIResponsesBody(rawBody)
+						}
+						if codexChanged {
+							codexBody = strippedCodexBody
+							expandedInputRaw = responsesInputRaw(codexBody)
+						}
+						log.Printf("OpenAI Responses 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+						h.store.Release(account)
+						h.store.UnbindSessionAffinity(affinityKey, account.ID())
+						continue
+					}
+				}
+
 				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
-				errBody, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				excludeAccounts[account.ID()] = true
@@ -1096,6 +1356,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			var writeErr error
 			wroteAnyBody := false
 			var imageLogInfo imageUsageLogInfo
+			var terminalFailurePayload []byte
 
 			if isStream {
 				c.Header("Content-Type", "text/event-stream")
@@ -1132,6 +1393,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						gotTerminal = true
 					}
 					if eventType == "response.failed" {
+						terminalFailurePayload = append([]byte(nil), data...)
 						gotTerminal = true
 					}
 					if image, ok := extractImageFromOutputItemDone(data, model); ok {
@@ -1168,6 +1430,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			totalDuration := int(time.Since(start).Milliseconds())
 			outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+			if len(terminalFailurePayload) > 0 {
+				outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+			}
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
@@ -1214,6 +1479,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+				logInput.UpstreamErrorKind = outcome.failureKind
 			}
 			if usage != nil {
 				logInput.PromptTokens = usage.PromptTokens
@@ -1276,12 +1542,33 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
+				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+				if rawChanged || codexChanged {
+					invalidEncryptedContentRetried = true
+					if rawChanged {
+						rawBody = strippedRawBody
+						openAIResponsesBody = PrepareOpenAIResponsesBody(rawBody)
+					}
+					if codexChanged {
+						codexBody = strippedCodexBody
+						expandedInputRaw = responsesInputRaw(codexBody)
+					}
+					log.Printf("上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					continue
+				}
+			}
+
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
@@ -1336,6 +1623,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		wroteAnyBody := false
 		var responseJSON []byte
 		var imageLogInfo imageUsageLogInfo
+		var terminalFailurePayload []byte
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -1387,6 +1675,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
+					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 				}
 
@@ -1406,11 +1695,16 @@ func (h *Handler) Responses(c *gin.Context) {
 		} else {
 			// 非流式收集
 			var lastResponseData []byte
+			outputItems := make([]json.RawMessage, 0, 2)
+			seenOutputItems := make(map[string]struct{})
 			imageOutputs := make([]json.RawMessage, 0, 1)
 			seenImageOutputs := make(map[string]struct{})
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				if outputItem, ok := extractResponseOutputItemDone(data, seenOutputItems); ok {
+					outputItems = append(outputItems, outputItem)
+				}
 				if imageOutput, ok := extractResponseImageGenerationOutput(data, seenImageOutputs); ok {
 					imageOutputs = append(imageOutputs, imageOutput)
 				}
@@ -1434,6 +1728,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					return false
 				}
 				if eventType == "response.failed" {
+					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -1445,6 +1740,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				responseObj := gjson.GetBytes(lastResponseData, "response")
 				if responseObj.Exists() {
 					responseJSON = []byte(responseObj.Raw)
+					responseJSON = restoreMissingResponseOutputs(responseJSON, outputItems)
 					responseJSON = appendMissingResponseImageOutputs(responseJSON, imageOutputs)
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(responseJSON)
 				}
@@ -1454,6 +1750,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		if len(terminalFailurePayload) > 0 {
+			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
@@ -1482,7 +1781,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 		if !isStream {
-			if responseJSON != nil {
+			if len(terminalFailurePayload) > 0 {
+				c.JSON(logStatusCode, gin.H{
+					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+				})
+			} else if responseJSON != nil {
 				c.Data(http.StatusOK, "application/json", responseJSON)
 			} else {
 				c.JSON(http.StatusBadGateway, gin.H{
@@ -1509,6 +1812,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+			logInput.UpstreamErrorKind = outcome.failureKind
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
@@ -1603,6 +1907,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	accountFilter := accountFilterForModel(effectiveModel)
+	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	// 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -1612,6 +1917,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
+	invalidEncryptedContentRetried := false
 
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
@@ -1665,12 +1971,31 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
+				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+				if rawChanged || codexChanged {
+					invalidEncryptedContentRetried = true
+					if rawChanged {
+						rawBody = strippedRawBody
+					}
+					if codexChanged {
+						codexBody = strippedCodexBody
+					}
+					log.Printf("compact 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					continue
+				}
+			}
+
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
@@ -1809,6 +2134,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	accountFilter := accountFilterForModel(effectiveModel)
+	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)
@@ -1962,6 +2288,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var compactResult []byte
+		var terminalFailurePayload []byte
 
 		chunkID := "chatcmpl-" + uuid.New().String()[:8]
 		created := time.Now().Unix()
@@ -2008,6 +2335,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
+					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 				}
 
@@ -2070,6 +2398,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					gotTerminal = true
 					return false
 				case "response.failed":
+					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
 					return false
 				}
@@ -2082,6 +2411,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		if len(terminalFailurePayload) > 0 {
+			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
@@ -2110,7 +2442,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 		}
 		if !isStream {
-			if compactResult != nil {
+			if len(terminalFailurePayload) > 0 {
+				c.JSON(logStatusCode, gin.H{
+					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+				})
+			} else if compactResult != nil {
 				c.Data(http.StatusOK, "application/json", compactResult)
 			} else {
 				c.JSON(http.StatusBadGateway, gin.H{
@@ -2137,6 +2473,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+			logInput.UpstreamErrorKind = outcome.failureKind
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens

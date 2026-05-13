@@ -22,6 +22,91 @@ func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 	}
 }
 
+func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	key := "sk-test-lookup-1234567890"
+	id, err := db.InsertAPIKey(ctx, "lookup", key)
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+	count, err := db.CountAPIKeys(ctx)
+	if err != nil {
+		t.Fatalf("CountAPIKeys 返回错误: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("CountAPIKeys = %d, want 1", count)
+	}
+	row, err := db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue 返回错误: %v", err)
+	}
+	if row.ID != id || row.Name != "lookup" || row.Key != key {
+		t.Fatalf("API key row = %#v, want id=%d name=lookup key=%s", row, id, key)
+	}
+}
+
+func TestSQLiteAPIKeyQuotaAndExpiration(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	key := "sk-test-limited-1234567890"
+	expiresAt := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	id, err := db.InsertAPIKeyWithOptions(ctx, APIKeyInput{
+		Name:       "limited",
+		Key:        key,
+		QuotaLimit: 0.01,
+		ExpiresAt:  sql.NullTime{Time: expiresAt, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions 返回错误: %v", err)
+	}
+
+	row, err := db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue 返回错误: %v", err)
+	}
+	if row.ID != id || row.QuotaLimit != 0.01 || !row.ExpiresAt.Valid {
+		t.Fatalf("API key row = %#v, want quota and expiration", row)
+	}
+	if !row.ExpiresAt.Time.Equal(expiresAt) {
+		t.Fatalf("ExpiresAt = %s, want %s", row.ExpiresAt.Time, expiresAt)
+	}
+
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		APIKeyID:     id,
+		Endpoint:     "/v1/responses",
+		Model:        "gpt-5.4",
+		StatusCode:   200,
+		InputTokens:  1000,
+		OutputTokens: 0,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	row, err = db.GetAPIKeyByValue(ctx, key)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue after usage 返回错误: %v", err)
+	}
+	if row.QuotaUsed != 0.0025 {
+		t.Fatalf("QuotaUsed = %.12f, want %.12f", row.QuotaUsed, 0.0025)
+	}
+}
+
 func TestSQLiteAccountsEnabledDefaultsAndCanToggle(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -585,6 +670,124 @@ func TestUsageStatsIncludeBillingTotals(t *testing.T) {
 	}
 	if stats.TodayAccountBilled != want || stats.TodayUserBilled != want {
 		t.Fatalf("today billing = account %.12f user %.12f, want %.12f", stats.TodayAccountBilled, stats.TodayUserBilled, want)
+	}
+	if stats.AvgAccountBilled != want || stats.AvgUserBilled != want {
+		t.Fatalf("avg billing = account %.12f user %.12f, want %.12f", stats.AvgAccountBilled, stats.AvgUserBilled, want)
+	}
+	if len(stats.ModelStats) != 1 {
+		t.Fatalf("ModelStats len = %d, want 1: %+v", len(stats.ModelStats), stats.ModelStats)
+	}
+	modelStats := stats.ModelStats[0]
+	if modelStats.Model != "gpt-5.5" || modelStats.Requests != 1 || modelStats.Tokens != 1500 {
+		t.Fatalf("ModelStats[0] = %+v, want gpt-5.5 requests=1 tokens=1500", modelStats)
+	}
+	if modelStats.AccountBilled != want || modelStats.UserBilled != want {
+		t.Fatalf("model billing = account %.12f user %.12f, want %.12f", modelStats.AccountBilled, modelStats.UserBilled, want)
+	}
+}
+
+func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	logs := []*UsageLogInput{
+		{
+			AccountID:       1,
+			Endpoint:        "/v1/responses",
+			InboundEndpoint: "/v1/responses",
+			Model:           "gpt-5.5",
+			StatusCode:      200,
+			InputTokens:     1000,
+			OutputTokens:    500,
+			TotalTokens:     1500,
+			Stream:          true,
+			ServiceTier:     "fast",
+			CachedTokens:    128,
+			ReasoningTokens: 32,
+			APIKeyID:        7,
+			APIKeyName:      "Claude Code",
+			APIKeyMasked:    "sk-...1111",
+		},
+		{
+			AccountID:       1,
+			Endpoint:        "/v1/images/generations",
+			InboundEndpoint: "/v1/images/generations",
+			Model:           "gpt-image-2",
+			StatusCode:      200,
+			ImageCount:      1,
+			APIKeyID:        7,
+			APIKeyName:      "Claude Code",
+			APIKeyMasked:    "sk-...1111",
+		},
+		{
+			AccountID:      2,
+			Endpoint:       "/v1/chat/completions",
+			Model:          "gpt-5.4",
+			StatusCode:     500,
+			InputTokens:    100,
+			OutputTokens:   20,
+			TotalTokens:    120,
+			APIKeyID:       8,
+			APIKeyName:     "Cherry Studio",
+			APIKeyMasked:   "sk-...2222",
+			IsRetryAttempt: true,
+			AttemptIndex:   1,
+		},
+		{
+			AccountID:       3,
+			Endpoint:        "/v1/responses",
+			InboundEndpoint: "/v1/responses",
+			Model:           "gpt-5.4",
+			StatusCode:      499,
+			Stream:          true,
+			APIKeyID:        9,
+			APIKeyName:      "Canceled",
+		},
+	}
+	for _, usageLog := range logs {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	stats, err := db.GetUsageStats(ctx)
+	if err != nil {
+		t.Fatalf("GetUsageStats 返回错误: %v", err)
+	}
+	if stats.TotalRequests != 3 {
+		t.Fatalf("TotalRequests = %d, want 3", stats.TotalRequests)
+	}
+	features := stats.FeatureStats
+	if features.StreamRequests != 1 || features.SyncRequests != 2 || features.FastRequests != 1 ||
+		features.CacheHitRequests != 1 || features.ReasoningRequests != 1 || features.ImageRequests != 1 ||
+		features.RetryRequests != 1 || features.ErrorRequests != 1 {
+		t.Fatalf("FeatureStats = %+v, want stream/sync/fast/cache/reasoning/image/retry/error = 1/2/1/1/1/1/1/1", features)
+	}
+
+	endpoints := make(map[string]UsageEndpointStat)
+	for _, item := range stats.EndpointStats {
+		endpoints[item.Endpoint] = item
+	}
+	if endpoints["/v1/responses"].Requests != 1 || endpoints["/v1/images/generations"].Requests != 1 || endpoints["/v1/chat/completions"].ErrorCount != 1 {
+		t.Fatalf("EndpointStats = %+v", stats.EndpointStats)
+	}
+
+	apiKeys := make(map[int64]UsageAPIKeyStat)
+	for _, item := range stats.APIKeyStats {
+		apiKeys[item.APIKeyID] = item
+	}
+	if apiKeys[7].Requests != 2 || apiKeys[7].Label != "Claude Code" {
+		t.Fatalf("APIKeyStats[7] = %+v, want Claude Code requests=2", apiKeys[7])
+	}
+	if apiKeys[8].Requests != 1 || apiKeys[8].ErrorCount != 1 {
+		t.Fatalf("APIKeyStats[8] = %+v, want requests=1 errors=1", apiKeys[8])
 	}
 }
 

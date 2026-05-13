@@ -1,14 +1,19 @@
 package proxy
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
+	"time"
 
+	"github.com/codex2api/cache"
 	"github.com/tidwall/gjson"
 )
 
 func resetResponseCacheForTest() {
 	respCache.mu.Lock()
 	respCache.store = make(map[string]*responseCacheEntry)
+	respCache.runtimeCache = nil
 	respCache.mu.Unlock()
 }
 
@@ -55,6 +60,39 @@ func TestExpandPreviousResponseUsesCachedCodexNativeToolContext(t *testing.T) {
 	}
 	if callID := input[2].Get("call_id").String(); callID != "call_mcp" {
 		t.Fatalf("current output call_id = %q, want call_mcp", callID)
+	}
+}
+
+func TestExpandPreviousResponseUsesRuntimeCacheAfterLocalMiss(t *testing.T) {
+	resetResponseCacheForTest()
+	tc := cache.NewMemory(10)
+	SetResponseContextCache(tc)
+	t.Cleanup(func() {
+		SetResponseContextCache(nil)
+		_ = tc.Close()
+	})
+
+	ctx := context.Background()
+	items := []json.RawMessage{
+		json.RawMessage(`{"type":"message","role":"user","content":"run mcp tool"}`),
+		json.RawMessage(`{"type":"mcp_tool_call","call_id":"call_mcp","name":"read","arguments":"{}"}`),
+	}
+	if err := tc.SetResponseContext(ctx, "resp_remote", items, time.Minute); err != nil {
+		t.Fatalf("SetResponseContext: %v", err)
+	}
+
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_remote","input":[{"type":"mcp_tool_call_output","call_id":"call_mcp","output":"ok"}]}`)
+	got, prevID := expandPreviousResponse(body)
+
+	if prevID != "resp_remote" {
+		t.Fatalf("prevID = %q, want resp_remote", prevID)
+	}
+	input := gjson.GetBytes(got, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("expanded input count = %d, want 3; body=%s", len(input), got)
+	}
+	if typ := input[1].Get("type").String(); typ != "mcp_tool_call" {
+		t.Fatalf("cached tool call type = %q, want mcp_tool_call", typ)
 	}
 }
 
@@ -137,7 +175,10 @@ func TestCacheCompletedResponseSkipsReasoningAndMessageOutputItems(t *testing.T)
 	resetResponseCacheForTest()
 
 	cacheCompletedResponse(
-		[]byte(`[{"type":"message","id":"msg_input","role":"user","content":"call a tool"}]`),
+		[]byte(`[`+
+			`{"type":"reasoning","id":"rs_input","encrypted_content":"stale"},`+
+			`{"type":"message","id":"msg_input","role":"user","content":"call a tool"}`+
+			`]`),
 		[]byte(`{"type":"response.completed","response":{"id":"resp_reasoning","output":[`+
 			`{"type":"reasoning","id":"rs_0609","encrypted_content":"opaque"},`+
 			`{"type":"message","id":"msg_output","role":"assistant","content":[{"type":"output_text","text":"thinking"}]},`+

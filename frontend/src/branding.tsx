@@ -5,7 +5,7 @@ import defaultLogo from './assets/logo.png'
 
 export const DEFAULT_SITE_NAME = 'CodexProxy'
 export const DEFAULT_SITE_LOGO = defaultLogo
-const DEFAULT_FAVICON = '/favicon.png'
+const DEFAULT_FAVICON = `${import.meta.env.BASE_URL}favicon.png`
 
 type BrandingContextValue = {
   siteName: string

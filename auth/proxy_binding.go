@@ -29,8 +29,12 @@ const minBindValidityHours = 1
 type BindingManager struct {
 	db *database.DB
 
-	mu              sync.RWMutex
-	recentFailures  map[int64]time.Time // proxyID → 失败时刻
+	mu             sync.RWMutex
+	recentFailures map[int64]time.Time // proxyID → 失败时刻
+
+	// bindMu 串行化 AutoBind 的"读快照 → 挑代理 → 写绑定"流程，
+	// 避免并发导入时多个 goroutine 看到同一份 used_slots 快照而把同一代理绑爆
+	bindMu sync.Mutex
 }
 
 // NewBindingManager 创建管理器
@@ -111,6 +115,8 @@ func (m *BindingManager) AutoBind(ctx context.Context, accountID int64) (int64, 
 	if m == nil || m.db == nil || accountID <= 0 {
 		return 0, errors.New("invalid binding manager / account id")
 	}
+	m.bindMu.Lock()
+	defer m.bindMu.Unlock()
 	proxies, err := m.db.ListEnabledProxies(ctx)
 	if err != nil {
 		return 0, err
@@ -136,7 +142,10 @@ func (m *BindingManager) AutoBind(ctx context.Context, accountID int64) (int64, 
 		}
 	}
 	if best == nil {
-		return 0, errors.New("代理池无可用代理：空闲槽位 + 有效期均不足")
+		if len(proxies) == 0 {
+			return 0, errors.New("代理池为空：请先添加至少一个已启用代理")
+		}
+		return 0, errors.New("代理池槽位已满 / 有效期不足：所有已启用代理均无可用槽位")
 	}
 	if err := m.db.UpsertProxyBinding(ctx, accountID, best.ID); err != nil {
 		return 0, err

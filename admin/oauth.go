@@ -265,8 +265,13 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "Token 写入数据库失败: "+err.Error())
 		return
 	}
+	if bindErr := h.tryAutoBindProxy(ctx, id, proxyURL); bindErr != nil {
+		log.Printf("OAuth 账号 %d 绑定代理失败，回滚: %v", id, bindErr)
+		_ = h.db.SoftDeleteAccount(ctx, id)
+		writeError(c, http.StatusBadRequest, "绑定代理失败："+bindErr.Error())
+		return
+	}
 	h.db.InsertAccountEventAsync(id, "added", "oauth")
-	h.tryAutoBindProxy(ctx, id, proxyURL)
 
 	// Resin 租约继承
 	if proxy.IsResinEnabled() {
@@ -447,8 +452,17 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		c.String(http.StatusOK, oauthCallbackPage("授权失败", "写入 token 失败: "+err.Error(), false))
 		return
 	}
+	if bindErr := h.tryAutoBindProxy(ctx, id, sess.ProxyURL); bindErr != nil {
+		log.Printf("OAuth 回调账号 %d 绑定代理失败，回滚: %v", id, bindErr)
+		_ = h.db.SoftDeleteAccount(ctx, id)
+		sess.ExchangeResult = &oauthExchangeResult{
+			Success: false,
+			Error:   "绑定代理失败：" + bindErr.Error(),
+		}
+		c.String(http.StatusOK, oauthCallbackPage("授权失败", "绑定代理失败："+bindErr.Error(), false))
+		return
+	}
 	h.db.InsertAccountEventAsync(id, "added", "oauth_callback")
-	h.tryAutoBindProxy(ctx, id, sess.ProxyURL)
 
 	// Resin 租约继承：将临时身份的 IP 租约迁移到正式 DBID
 	if proxy.IsResinEnabled() {

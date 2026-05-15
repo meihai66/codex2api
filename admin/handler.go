@@ -1039,9 +1039,15 @@ func (h *Handler) AddAccount(c *gin.Context) {
 			continue
 		}
 
+		if bindErr := h.tryAutoBindProxy(ctx, id, req.ProxyURL); bindErr != nil {
+			log.Printf("批量添加账号 %d 绑定代理失败，回滚: %v", i+1, bindErr)
+			_ = h.db.SoftDeleteAccount(ctx, id)
+			failCount++
+			continue
+		}
+
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual")
-		h.tryAutoBindProxy(ctx, id, req.ProxyURL)
 
 		// 热加载：直接加入内存池
 		newAcc := &auth.Account{
@@ -1157,9 +1163,15 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			continue
 		}
 
+		if bindErr := h.tryAutoBindProxy(ctx, id, req.ProxyURL); bindErr != nil {
+			log.Printf("添加 AT 账号 %d 绑定代理失败，回滚: %v", i+1, bindErr)
+			_ = h.db.SoftDeleteAccount(ctx, id)
+			failCount++
+			continue
+		}
+
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual_at")
-		h.tryAutoBindProxy(ctx, id, req.ProxyURL)
 
 		// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
 		atInfo := auth.ParseAccessToken(at)
@@ -1299,8 +1311,13 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	if bindErr := h.tryAutoBindProxy(ctx, id, req.ProxyURL); bindErr != nil {
+		log.Printf("添加 OpenAI Responses 账号 %d 绑定代理失败，回滚: %v", id, bindErr)
+		_ = h.db.SoftDeleteAccount(ctx, id)
+		writeError(c, http.StatusBadRequest, "绑定代理失败："+bindErr.Error())
+		return
+	}
 	h.db.InsertAccountEventAsync(id, "added", "manual_openai_responses")
-	h.tryAutoBindProxy(ctx, id, req.ProxyURL)
 
 	h.store.AddAccount(&auth.Account{
 		DBID:         id,
@@ -2071,12 +2088,22 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					return
 				}
 
+				bindCtx, bindCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				bindErr := h.tryAutoBindProxy(bindCtx, id, proxyURL)
+				bindCancel()
+				if bindErr != nil {
+					log.Printf("导入 AT 账号 %d/%d 绑定代理失败，回滚: %v", idx+1, len(newTokens), bindErr)
+					delCtx, delCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					_ = h.db.SoftDeleteAccount(delCtx, id)
+					delCancel()
+					atomic.AddInt64(&failCount, 1)
+					atomic.AddInt64(&current, 1)
+					return
+				}
+
 				atomic.AddInt64(&successCount, 1)
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import_at")
-				bindCtx, bindCancel := context.WithTimeout(context.Background(), 3*time.Second)
-				h.tryAutoBindProxy(bindCtx, id, proxyURL)
-				bindCancel()
 
 				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
 					sessionToken:        tok.sessionToken,
@@ -2136,12 +2163,22 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					return
 				}
 
+				bindCtx, bindCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				bindErr := h.tryAutoBindProxy(bindCtx, id, proxyURL)
+				bindCancel()
+				if bindErr != nil {
+					log.Printf("导入账号 %d/%d 绑定代理失败，回滚: %v", idx+1, len(newTokens), bindErr)
+					delCtx, delCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					_ = h.db.SoftDeleteAccount(delCtx, id)
+					delCancel()
+					atomic.AddInt64(&failCount, 1)
+					atomic.AddInt64(&current, 1)
+					return
+				}
+
 				atomic.AddInt64(&successCount, 1)
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import")
-				bindCtx, bindCancel := context.WithTimeout(context.Background(), 3*time.Second)
-				h.tryAutoBindProxy(bindCtx, id, proxyURL)
-				bindCancel()
 
 				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
 					refreshToken:        tok.refreshToken,

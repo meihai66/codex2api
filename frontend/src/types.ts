@@ -62,6 +62,7 @@ export interface AccountRow {
   last_server_error_at?: ISODateString
   proxy_url: string
   bound_proxy_ip_port?: string
+  import_batch_id?: string
   created_at: ISODateString
   updated_at: ISODateString
   active_requests?: number

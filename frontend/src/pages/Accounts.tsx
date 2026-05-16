@@ -118,6 +118,7 @@ export default function Accounts() {
   const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'error' | 'disabled' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'prolite' | 'plus' | 'team' | 'free'>('all')
+  const [importBatchFilter, setImportBatchFilter] = useState<string>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
   const [addForm, setAddForm] = useState<AddAccountRequest>({
@@ -329,6 +330,14 @@ export default function Accounts() {
         const plan = (account.plan_type || '').toLowerCase().trim()
         if (plan !== planFilter) return false
       }
+      if (importBatchFilter !== 'all') {
+        const batchID = account.import_batch_id || ''
+        if (importBatchFilter === '__manual__') {
+          if (batchID !== '') return false
+        } else if (batchID !== importBatchFilter) {
+          return false
+        }
+      }
       if (query) {
         const email = (account.email || '').toLowerCase()
         const name = (account.name || '').toLowerCase()
@@ -336,7 +345,54 @@ export default function Accounts() {
       }
       return true
     })
-  }, [accounts, planFilter, searchQuery, statusFilter])
+  }, [accounts, importBatchFilter, planFilter, searchQuery, statusFilter])
+
+  const importBatches = useMemo(() => {
+    const map = new Map<string, { count: number; firstAt: string }>()
+    let manualCount = 0
+    for (const acc of accounts) {
+      const id = acc.import_batch_id || ''
+      if (!id) {
+        manualCount += 1
+        continue
+      }
+      const existing = map.get(id)
+      const createdAt = acc.created_at || ''
+      if (existing) {
+        existing.count += 1
+        if (createdAt && (!existing.firstAt || createdAt < existing.firstAt)) {
+          existing.firstAt = createdAt
+        }
+      } else {
+        map.set(id, { count: 1, firstAt: createdAt })
+      }
+    }
+    const items = Array.from(map.entries()).map(([batchID, info]) => ({
+      batchID,
+      count: info.count,
+      firstAt: info.firstAt,
+    }))
+    items.sort((a, b) => b.firstAt.localeCompare(a.firstAt))
+    return { items, manualCount }
+  }, [accounts])
+
+  const formatBatchLabel = useCallback((batchID: string) => {
+    // 期望格式 YYYYMMDD-HHMMSS-rrrr；解析为可读时间戳
+    const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(batchID)
+    if (!m) return batchID
+    return `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}`
+  }, [])
+
+  useEffect(() => {
+    if (importBatchFilter === 'all') return
+    if (importBatchFilter === '__manual__') {
+      if (importBatches.manualCount === 0) setImportBatchFilter('all')
+      return
+    }
+    if (!importBatches.items.some((b) => b.batchID === importBatchFilter)) {
+      setImportBatchFilter('all')
+    }
+  }, [importBatchFilter, importBatches])
 
   const sortedAccounts = useMemo(() => {
     if (!sortKey) return filteredAccounts
@@ -1527,6 +1583,28 @@ export default function Accounts() {
               </button>
             ))}
           </div>
+          {(importBatches.items.length > 0 || importBatches.manualCount > 0) && (
+            <div className="flex items-center gap-2">
+              <span className="text-[12px] font-medium text-muted-foreground">{t('accounts.importBatch')}</span>
+              <select
+                value={importBatchFilter}
+                onChange={(e: ChangeEvent<HTMLSelectElement>) => { setImportBatchFilter(e.target.value); setPage(1) }}
+                className="h-8 rounded-lg border border-border bg-background px-2 text-[12px] font-medium text-foreground focus:outline-none focus:ring-2 focus:ring-primary/30"
+              >
+                <option value="all">{t('accounts.importBatchAll')} ({accounts.length})</option>
+                {importBatches.items.map((b) => (
+                  <option key={b.batchID} value={b.batchID}>
+                    {t('accounts.importBatchOption', { label: formatBatchLabel(b.batchID), count: b.count })}
+                  </option>
+                ))}
+                {importBatches.manualCount > 0 && (
+                  <option value="__manual__">
+                    {t('accounts.importBatchOption', { label: t('accounts.importBatchManual'), count: importBatches.manualCount })}
+                  </option>
+                )}
+              </select>
+            </div>
+          )}
         </div>
 
         {selected.size > 0 && (

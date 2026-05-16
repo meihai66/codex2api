@@ -31,6 +31,7 @@ type AccountRow struct {
 	Locked                  bool
 	ScoreBiasOverride       sql.NullInt64
 	BaseConcurrencyOverride sql.NullInt64
+	ImportBatchID           string
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
 }
@@ -443,6 +444,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS image_quota_total INT NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS today_used_count INT DEFAULT 0;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS image_quota_reset_at TIMESTAMPTZ NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS import_batch_id VARCHAR(64) DEFAULT '';
 
 	UPDATE accounts
 	SET status = 'deleted',
@@ -456,6 +458,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 	CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform);
 	CREATE INDEX IF NOT EXISTS idx_accounts_cooldown_until ON accounts(cooldown_until);
+	CREATE INDEX IF NOT EXISTS idx_accounts_import_batch_id ON accounts(import_batch_id);
 
 
 	CREATE TABLE IF NOT EXISTS usage_logs (
@@ -2813,7 +2816,7 @@ func (db *DB) GetAccountTimeRangeUsage(ctx context.Context, since time.Time) (ma
 // ListActive 获取所有未删除账号。
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), score_bias_override, base_concurrency_override, created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), score_bias_override, base_concurrency_override, COALESCE(import_batch_id, ''), created_at, updated_at
 		FROM accounts
 		WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
 		ORDER BY id
@@ -2846,6 +2849,7 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&a.Locked,
 			&a.ScoreBiasOverride,
 			&a.BaseConcurrencyOverride,
+			&a.ImportBatchID,
 			&createdAtRaw,
 			&updatedAtRaw,
 		); err != nil {
@@ -2867,6 +2871,53 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+// ImportBatchSummary 描述一次批量导入的汇总。
+type ImportBatchSummary struct {
+	BatchID         string
+	Count           int64
+	FirstImportedAt time.Time
+	LastImportedAt  time.Time
+}
+
+// ListImportBatches 返回所有非空 import_batch_id 的批次汇总，按首条导入时间倒序。
+// 仅统计未删除（含锁定/禁用/异常）账号；已删除账号不计入。
+func (db *DB) ListImportBatches(ctx context.Context) ([]ImportBatchSummary, error) {
+	query := `
+		SELECT import_batch_id, COUNT(*) AS cnt, MIN(created_at) AS first_at, MAX(created_at) AS last_at
+		FROM accounts
+		WHERE status <> 'deleted'
+		  AND COALESCE(error_message, '') <> 'deleted'
+		  AND COALESCE(import_batch_id, '') <> ''
+		GROUP BY import_batch_id
+		ORDER BY first_at DESC
+	`
+	rows, err := db.conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("查询导入批次失败: %w", err)
+	}
+	defer rows.Close()
+
+	var batches []ImportBatchSummary
+	for rows.Next() {
+		var b ImportBatchSummary
+		var firstRaw interface{}
+		var lastRaw interface{}
+		if err := rows.Scan(&b.BatchID, &b.Count, &firstRaw, &lastRaw); err != nil {
+			return nil, fmt.Errorf("扫描批次行失败: %w", err)
+		}
+		b.FirstImportedAt, err = parseDBTimeValue(firstRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析批次首次导入时间失败: %w", err)
+		}
+		b.LastImportedAt, err = parseDBTimeValue(lastRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析批次最后导入时间失败: %w", err)
+		}
+		batches = append(batches, b)
+	}
+	return batches, rows.Err()
 }
 
 func (db *DB) ListActiveModelCooldowns(ctx context.Context) ([]*AccountModelCooldownRow, error) {
@@ -3406,6 +3457,23 @@ func (db *DB) InsertAccountWithCredentials(ctx context.Context, name string, cre
 		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3) RETURNING id`,
 		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3)`,
 		name, credJSON, proxyURL,
+	)
+}
+
+// InsertAccountWithCredentialsAndBatch 用于批量导入：写入 credentials + import_batch_id。
+func (db *DB) InsertAccountWithCredentialsAndBatch(ctx context.Context, name string, credentials map[string]interface{}, proxyURL string, importBatchID string) (int64, error) {
+	if credentials == nil {
+		credentials = map[string]interface{}{}
+	}
+	credJSON, err := json.Marshal(credentials)
+	if err != nil {
+		return 0, err
+	}
+
+	return db.insertRowID(ctx,
+		`INSERT INTO accounts (name, credentials, proxy_url, import_batch_id) VALUES ($1, $2, $3, $4) RETURNING id`,
+		`INSERT INTO accounts (name, credentials, proxy_url, import_batch_id) VALUES ($1, $2, $3, $4)`,
+		name, credJSON, proxyURL, importBatchID,
 	)
 }
 

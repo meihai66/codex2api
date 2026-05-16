@@ -218,6 +218,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
+	api.GET("/accounts/import-batches", h.ListImportBatches)
 	api.GET("/usage/stats", h.GetUsageStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
@@ -399,6 +400,7 @@ type accountResponse struct {
 	ConcurrencyCap           int64                      `json:"dynamic_concurrency_limit"`
 	ProxyURL                 string                     `json:"proxy_url"`
 	BoundProxyHostPort       string                     `json:"bound_proxy_ip_port,omitempty"`
+	ImportBatchID            string                     `json:"import_batch_id,omitempty"`
 	CreatedAt                string                     `json:"created_at"`
 	UpdatedAt                string                     `json:"updated_at"`
 	ActiveRequests           int64                      `json:"active_requests"`
@@ -547,6 +549,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Enabled:                  row.Enabled,
 			Locked:                   row.Locked,
 			AllowedAPIKeyIDs:         row.GetCredentialInt64Slice("allowed_api_key_ids"),
+			ImportBatchID:            row.ImportBatchID,
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),
 			ScoreBiasEffective:       effectiveScoreBias(planType, row.ScoreBiasOverride),
 			BaseConcurrencyOverride:  nullableInt64Pointer(row.BaseConcurrencyOverride),
@@ -1903,6 +1906,52 @@ type importEvent struct {
 	Success   int    `json:"success"`
 	Duplicate int    `json:"duplicate"`
 	Failed    int    `json:"failed"`
+	BatchID   string `json:"batch_id,omitempty"`
+}
+
+type importBatchResponse struct {
+	BatchID         string `json:"batch_id"`
+	Count           int64  `json:"count"`
+	FirstImportedAt string `json:"first_imported_at"`
+	LastImportedAt  string `json:"last_imported_at,omitempty"`
+}
+
+// ListImportBatches 列出所有批量导入批次。
+// GET /api/admin/accounts/import-batches
+func (h *Handler) ListImportBatches(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	batches, err := h.db.ListImportBatches(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	resp := make([]importBatchResponse, 0, len(batches))
+	for _, b := range batches {
+		item := importBatchResponse{
+			BatchID:         b.BatchID,
+			Count:           b.Count,
+			FirstImportedAt: b.FirstImportedAt.Format(time.RFC3339),
+		}
+		if !b.LastImportedAt.Equal(b.FirstImportedAt) {
+			item.LastImportedAt = b.LastImportedAt.Format(time.RFC3339)
+		}
+		resp = append(resp, item)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"batches": resp})
+}
+
+// newImportBatchID 生成一次导入的批次 ID，格式 YYYYMMDD-HHMMSS-rrrr。
+func newImportBatchID() string {
+	now := time.Now().Format("20060102-150405")
+	suffix := strconv.FormatInt(time.Now().UnixNano()%10000, 10)
+	for len(suffix) < 4 {
+		suffix = "0" + suffix
+	}
+	return now + "-" + suffix
 }
 
 func sendImportEvent(c *gin.Context, e importEvent) {
@@ -2032,6 +2081,8 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		return
 	}
 
+	batchID := newImportBatchID()
+
 	// 切换到 SSE 流式响应
 	setupSSE(c)
 
@@ -2078,7 +2129,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, err := h.db.InsertATAccount(insertCtx, name, tok.accessToken, proxyURL)
+				id, err := h.db.InsertAccountWithCredentialsAndBatch(insertCtx, name, map[string]interface{}{
+					"access_token": tok.accessToken,
+				}, proxyURL, batchID)
 				insertCancel()
 
 				if err != nil {
@@ -2136,7 +2189,9 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				var id int64
 				var err error
 				if tok.refreshToken != "" {
-					id, err = h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
+					id, err = h.db.InsertAccountWithCredentialsAndBatch(insertCtx, name, map[string]interface{}{
+						"refresh_token": tok.refreshToken,
+					}, proxyURL, batchID)
 				} else {
 					seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
 						sessionToken:        tok.sessionToken,
@@ -2152,7 +2207,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 						codex5HResetAt:      tok.codex5HResetAt,
 						codexUsageUpdatedAt: tok.codexUsageUpdatedAt,
 					})
-					id, err = h.db.InsertAccountWithCredentials(insertCtx, name, tokenCredentialMap(seed), proxyURL)
+					id, err = h.db.InsertAccountWithCredentialsAndBatch(insertCtx, name, tokenCredentialMap(seed), proxyURL, batchID)
 				}
 				insertCancel()
 
@@ -2227,12 +2282,17 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	// 发送完成事件
 	suc := int(atomic.LoadInt64(&successCount))
 	fai := int(atomic.LoadInt64(&failCount))
+	completeBatch := ""
+	if suc > 0 {
+		completeBatch = batchID
+	}
 	sendImportEvent(c, importEvent{
 		Type: "complete", Current: total, Total: total,
 		Success: suc, Duplicate: duplicateCount, Failed: fai,
+		BatchID: completeBatch,
 	})
 
-	log.Printf("导入完成: success=%d, duplicate=%d, failed=%d, total=%d", suc, duplicateCount, fai, total)
+	log.Printf("导入完成: batch=%s success=%d, duplicate=%d, failed=%d, total=%d", batchID, suc, duplicateCount, fai, total)
 }
 
 // importAccountsATTXT 通过 TXT 文件导入 AT-only 账号（每行一个 Access Token）

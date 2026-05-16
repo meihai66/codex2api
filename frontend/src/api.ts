@@ -185,6 +185,8 @@ export const api = {
   getBranding: () => requestPublic<SiteBranding>('/api/branding'),
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
+  getImportBatches: () =>
+    request<{ batches: Array<{ batch_id: string; count: number; first_imported_at: string; last_imported_at?: string }> }>('/accounts/import-batches'),
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
